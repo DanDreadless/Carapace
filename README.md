@@ -1,6 +1,6 @@
 # Carapace
 
-<img src="images/Carapace.png" width="100" alt="Carapace">
+<img src="images/Carapace.png" width="400" alt="Carapace">
 
 Safe HTML/CSS/JS renderer for security researchers. Carapace fetches a URL, sanitises the page, and renders it to a PNG — without executing JavaScript, loading external resources, or making any network requests from the browser. A threat report is produced alongside every render.
 
