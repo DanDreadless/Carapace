@@ -1,6 +1,4 @@
 /target
 /docs
 Cargo.lock
-*.png
-*.pdf
-*.threat.json
+
