@@ -1,0 +1,27 @@
+services:
+  carapace:
+    build: .
+    image: carapace:latest
+
+    # Mount a local directory to retrieve rendered output and threat reports.
+    volumes:
+      - ./output:/output
+
+    # Drop every Linux capability — the process only needs network egress.
+    # No file-system writes outside the mounted volume and /tmp.
+    cap_drop:
+      - ALL
+
+    # Prevent privilege escalation inside the container.
+    security_opt:
+      - no-new-privileges:true
+
+    # Resource guardrails — adjust to taste.
+    mem_limit: 1g
+    cpus: "1.0"
+
+    # Default command shown for reference; override at `docker compose run`.
+    # Examples:
+    #   docker compose run --rm carapace render https://example.com -o /output/render.png
+    #   docker compose run --rm -p 8080:8080 carapace serve --port 8080
+    command: ["--help"]

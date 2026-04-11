@@ -1,0 +1,100 @@
+[package]
+name = "carapace"
+version = "0.1.0"
+edition = "2021"
+description = "Safe HTML/CSS/JS renderer for security researchers"
+license = "MIT"
+
+[dependencies]
+
+# ── HTTP / Network ─────────────────────────────────────────────────────────────
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
+url = "2.5.8"
+hickory-resolver = { version = "0.24.4", features = ["tokio-runtime"] }
+futures-util = "0.3.32"
+bytes = "1.11.1"
+
+# ── HTML Parsing ───────────────────────────────────────────────────────────────
+html5ever = "0.27.0"
+markup5ever_rcdom = "0.3.0"
+tendril = "0.4.3"
+
+# ── CSS ────────────────────────────────────────────────────────────────────────
+cssparser = "0.34.0"
+selectors = "0.26.0"
+grass = { version = "0.13.4", default-features = false }
+
+# ── JS Static Analysis ────────────────────────────────────────────────────────
+# These crates release frequently — all pinned to the versions in Cargo.lock.
+oxc_allocator = "0.39.0"
+oxc_parser    = "0.39.0"
+oxc_ast       = "0.39.0"
+oxc_span      = "0.39.0"
+
+# ── JS Sandbox Runtime ────────────────────────────────────────────────────────
+rquickjs = { version = "0.8.1", features = ["full", "loader"] }
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+taffy = "0.5.2"
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+tiny-skia  = "0.11.4"
+rustybuzz  = "0.14.1"
+ab_glyph   = "0.2.32"
+fontdb     = "0.22.0"
+image      = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# ── HTTP API Server ────────────────────────────────────────────────────────────
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.4", features = ["util"] }
+
+# ── Async Runtime ─────────────────────────────────────────────────────────────
+tokio = { version = "1.51.1", features = ["full"] }
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+clap = { version = "4.6.0", features = ["derive", "env"] }
+
+# ── Serialisation ─────────────────────────────────────────────────────────────
+serde      = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+indexmap   = { version = "2.14.0", features = ["serde"] }
+
+# ── Error Handling ────────────────────────────────────────────────────────────
+thiserror = "2.0.18"
+anyhow    = "1.0.102"
+
+# ── Observability ─────────────────────────────────────────────────────────────
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+base64      = "0.22.1"
+regex       = "1.12.3"
+encoding_rs = "0.8.35"
+chrono      = { version = "0.4.44", features = ["serde"] }
+sha2        = "0.10"
+resvg = "0.47.0"
+usvg = "0.47.0"
+
+[dev-dependencies]
+tokio-test  = "0.4.5"
+mockito     = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[[bin]]
+name = "carapace"
+path = "src/main.rs"

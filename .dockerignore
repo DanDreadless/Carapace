@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+output/
+*.png
+*.pdf
+*.json
