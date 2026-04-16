@@ -135,9 +135,10 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             }
 
             // (new Function(code))() — dynamic code generation
+            // new Function() with no arguments is a harmless React/framework idiom.
             Expression::NewExpression(new_expr) => {
                 if let Expression::Identifier(ident) = &new_expr.callee {
-                    if ident.name == "Function" {
+                    if ident.name == "Function" && !new_expr.arguments.is_empty() {
                         self.report.add_js_flag(JsFlag::FunctionConstructor(loc));
                     }
                 }
@@ -157,7 +158,7 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
 
         if let Expression::Identifier(ident) = &new_expr.callee {
             match ident.name.as_str() {
-                "Function" => {
+                "Function" if !new_expr.arguments.is_empty() => {
                     self.report.add_js_flag(JsFlag::FunctionConstructor(loc));
                 }
                 "XMLHttpRequest" => {

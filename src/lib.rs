@@ -266,6 +266,12 @@ fn check_drive_by_download(result: &fetcher::FetchResult, report: &mut ThreatRep
         return;
     }
 
+    // Suppress false positives: safe non-executable types (CSS, fonts, images, plain text)
+    // served with Content-Disposition: attachment are harmless downloads, not malware delivery.
+    if is_safe_content_type(&result.content_type) {
+        return;
+    }
+
     let sha256 = compute_sha256(&result.body);
     let filename = extract_filename(content_disposition, &result.url);
     let size = result.body.len() as u64;
@@ -307,6 +313,27 @@ fn is_download_content_type(ct: &str) -> bool {
             | "application/x-apple-diskimage"
             | "application/x-iso9660-image"
     )
+}
+
+/// Returns `true` for MIME types that cannot execute code in a browser — CSS, fonts,
+/// images, plain text.  A Content-Disposition: attachment on these is a benign download,
+/// not a malware delivery vector.
+fn is_safe_content_type(ct: &str) -> bool {
+    let bare = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    bare.starts_with("text/css")
+        || bare.starts_with("text/plain")
+        || bare.starts_with("image/")
+        || bare.starts_with("font/")
+        || bare.starts_with("audio/")
+        || bare.starts_with("video/")
+        || matches!(
+            bare.as_str(),
+            "application/font-woff"
+                | "application/font-woff2"
+                | "application/vnd.ms-fontobject"
+                | "application/x-font-ttf"
+                | "application/x-font-opentype"
+        )
 }
 
 /// Compute the hex-encoded SHA256 digest of `bytes`.
