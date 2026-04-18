@@ -151,11 +151,14 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
 
             // (new Function(code))() — dynamic code generation
             // new Function() with no arguments is a harmless React/framework idiom.
+            // new Function("return this") is the standard UMD/polyfill global-object idiom.
             Expression::NewExpression(new_expr) => {
                 if let Expression::Identifier(ident) = &new_expr.callee {
                     if ident.name == "Function" && !new_expr.arguments.is_empty() {
                         let arg = last_string_arg(&new_expr.arguments);
-                        self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                        if !is_benign_function_body(arg.as_deref()) {
+                            self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                        }
                     }
                 }
             }
@@ -176,7 +179,9 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             match ident.name.as_str() {
                 "Function" if !new_expr.arguments.is_empty() => {
                     let arg = last_string_arg(&new_expr.arguments);
-                    self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                    if !is_benign_function_body(arg.as_deref()) {
+                        self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                    }
                 }
                 "XMLHttpRequest" => {
                     self.report.add_js_flag(JsFlag::NetworkCall(NetworkCall {
@@ -340,6 +345,17 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
 /// Extract the string value of the first argument if it's a string literal.
 fn first_string_arg(args: &[Argument]) -> Option<String> {
     nth_string_arg(args, 0)
+}
+
+/// Returns true for known-benign `new Function(body)` bodies that should not fire.
+/// These are standard UMD / polyfill idioms present on virtually every complex site.
+fn is_benign_function_body(body: Option<&str>) -> bool {
+    match body {
+        // new Function("return this") — standard way to get the global object in strict mode.
+        // Used by Babel helpers, core-js, UMD wrappers, etc.
+        Some(b) if b.trim() == "return this" => true,
+        _ => false,
+    }
 }
 
 /// Extract the string value of the last argument — used for `new Function([p,] body)`.
