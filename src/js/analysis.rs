@@ -154,7 +154,8 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             Expression::NewExpression(new_expr) => {
                 if let Expression::Identifier(ident) = &new_expr.callee {
                     if ident.name == "Function" && !new_expr.arguments.is_empty() {
-                        self.report.add_js_flag(JsFlag::FunctionConstructor(loc));
+                        let arg = last_string_arg(&new_expr.arguments);
+                        self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
                     }
                 }
             }
@@ -174,7 +175,8 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
         if let Expression::Identifier(ident) = &new_expr.callee {
             match ident.name.as_str() {
                 "Function" if !new_expr.arguments.is_empty() => {
-                    self.report.add_js_flag(JsFlag::FunctionConstructor(loc));
+                    let arg = last_string_arg(&new_expr.arguments);
+                    self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
                 }
                 "XMLHttpRequest" => {
                     self.report.add_js_flag(JsFlag::NetworkCall(NetworkCall {
@@ -340,6 +342,17 @@ fn first_string_arg(args: &[Argument]) -> Option<String> {
     nth_string_arg(args, 0)
 }
 
+/// Extract the string value of the last argument — used for `new Function([p,] body)`.
+fn last_string_arg(args: &[Argument]) -> Option<String> {
+    args.last().and_then(|a| {
+        if let Argument::StringLiteral(s) = a {
+            Some(s.value.as_str().to_string())
+        } else {
+            None
+        }
+    })
+}
+
 /// Extract the string value of the nth argument if it's a string literal.
 fn nth_string_arg(args: &[Argument], n: usize) -> Option<String> {
     args.get(n).and_then(|a| {
@@ -426,7 +439,7 @@ mod tests {
     #[test]
     fn detects_function_constructor() {
         let report = run(r#"new Function("return 1")"#);
-        assert!(report.js_flags().iter().any(|f| matches!(f, JsFlag::FunctionConstructor(_))));
+        assert!(report.js_flags().iter().any(|f| matches!(f, JsFlag::FunctionConstructor { .. })));
     }
 
     #[test]

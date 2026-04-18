@@ -52,7 +52,7 @@ pub struct DecodedString {
 pub enum JsFlag {
     EvalCall(CodeLocation),
     EvalLiteralArg { value: String, loc: CodeLocation },
-    FunctionConstructor(CodeLocation),
+    FunctionConstructor { loc: CodeLocation, arg: Option<String> },
     DocumentWrite(CodeLocation),
     DangerousSink(DomMutation),
     NetworkCall(NetworkCall),
@@ -184,8 +184,15 @@ impl ThreatReport {
             JsFlag::EvalCall(_) => {
                 self.push_flag(Severity::Critical, "JS_EVAL_DETECTED", "eval() call".into());
             }
-            JsFlag::FunctionConstructor(_) => {
-                self.push_flag(Severity::Critical, "JS_FUNCTION_CONSTRUCTOR", "new Function()".into());
+            JsFlag::FunctionConstructor { arg, .. } => {
+                let detail = match arg {
+                    Some(body) => {
+                        let snippet = &body[..body.len().min(120)];
+                        format!("new Function({:?})", snippet)
+                    }
+                    None => "new Function(<non-literal body>)".into(),
+                };
+                self.push_flag(Severity::Critical, "JS_FUNCTION_CONSTRUCTOR", detail);
             }
             JsFlag::Base64Obfuscation(d) => {
                 let orig = &d.original[..d.original.len().min(40)];
@@ -364,7 +371,7 @@ impl ThreatReport {
         for f in &self.js_flags {
             let code = match f {
                 JsFlag::EvalCall(_) => "JS_EVAL_DETECTED",
-                JsFlag::FunctionConstructor(_) => "JS_FUNCTION_CONSTRUCTOR",
+                JsFlag::FunctionConstructor { .. } => "JS_FUNCTION_CONSTRUCTOR",
                 JsFlag::Base64Obfuscation(_) => "BASE64_OBFUSCATION",
                 JsFlag::HexObfuscation(_) => "HEX_OBFUSCATION",
                 JsFlag::NetworkCall(_) => "NETWORK_ATTEMPT_BLOCKED",
