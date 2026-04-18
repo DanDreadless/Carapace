@@ -214,11 +214,13 @@ impl ThreatReport {
             }
             JsFlag::SandboxEvasion { technique, detail, .. } => {
                 let (severity, code) = match technique.as_str() {
-                    "webdriver_check"     => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
-                    "headless_string_probe" => (Severity::High, "SANDBOX_EVASION_HEADLESS_STRING"),
+                    "webdriver_check"        => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
+                    "headless_string_probe"  => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
                     "screen_dimension_probe" => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
-                    "plugins_probe"       => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
-                    _                     => (Severity::Medium,  "SANDBOX_EVASION"),
+                    "plugins_probe"          => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
+                    "chrome_runtime_probe"   => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
+                    "focus_probe"            => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
+                    _                        => (Severity::Medium,  "SANDBOX_EVASION"),
                 };
                 self.push_flag(severity, code, detail.clone());
             }
@@ -230,6 +232,50 @@ impl ThreatReport {
 
     pub fn add_blocked_network(&mut self, url: String) {
         self.blocked_network.push(url);
+    }
+
+    /// Record a fullscreen CSS overlay — the structural signature of ClickFix
+    /// and SocGholish injections.  The `detail` string should include the
+    /// relevant CSS properties as a readable snippet for the evidence block.
+    pub fn add_css_overlay(&mut self, detail: &str) {
+        self.push_flag(
+            Severity::High,
+            "CSS_OVERLAY_INJECTED",
+            detail.to_string(),
+        );
+        self.recalculate_score();
+    }
+
+    /// Record URLs that JavaScript attempted to fetch at runtime (intercepted
+    /// by the logging proxy and rejected).  A single finding is emitted with
+    /// all unique domains listed in the evidence block.
+    pub fn add_intercepted_requests(&mut self, urls: &[String]) {
+        if urls.is_empty() {
+            return;
+        }
+        for url in urls {
+            self.blocked_network.push(url.clone());
+        }
+        let detail = urls
+            .iter()
+            .take(20)
+            .map(|u| format!("  {}", u))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = if urls.len() > 20 {
+            format!("{}\n  … and {} more", detail, urls.len() - 20)
+        } else {
+            detail
+        };
+        // Bypass push_flag deduplication so we always record the URL list.
+        if !self.flags.iter().any(|f| f.code == "INTERCEPTED_REQUEST") {
+            self.flags.push(Flag {
+                severity: Severity::Medium,
+                code: "INTERCEPTED_REQUEST".to_string(),
+                detail,
+            });
+            self.recalculate_score();
+        }
     }
 
     /// Record a drive-by download attempt.
@@ -307,11 +353,13 @@ impl ThreatReport {
                 JsFlag::CookieWrite(_) => "COOKIE_ACCESS",
                 JsFlag::TimerWithString { .. } => "TIMER_STRING_EXEC",
                 JsFlag::SandboxEvasion { technique, .. } => match technique.as_str() {
-                    "webdriver_check"       => "SANDBOX_EVASION_WEBDRIVER",
-                    "headless_string_probe" => "SANDBOX_EVASION_HEADLESS_STRING",
+                    "webdriver_check"        => "SANDBOX_EVASION_WEBDRIVER",
+                    "headless_string_probe"  => "SANDBOX_EVASION_HEADLESS_STRING",
                     "screen_dimension_probe" => "SANDBOX_EVASION_SCREEN_PROBE",
-                    "plugins_probe"         => "SANDBOX_EVASION_PLUGINS_PROBE",
-                    _                       => "SANDBOX_EVASION",
+                    "plugins_probe"          => "SANDBOX_EVASION_PLUGINS_PROBE",
+                    "chrome_runtime_probe"   => "SANDBOX_EVASION_CHROME_RUNTIME",
+                    "focus_probe"            => "SANDBOX_EVASION_FOCUS_PROBE",
+                    _                        => "SANDBOX_EVASION",
                 },
                 _ => continue,
             };

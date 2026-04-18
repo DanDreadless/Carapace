@@ -158,6 +158,15 @@ impl<'a> Sanitizer<'a> {
                         });
                         to_remove.push(i);
                     }
+                    // Fullscreen overlay on an individual element — the canonical
+                    // ClickFix / SocGholish inline-style attack pattern.
+                    else if is_fullscreen_overlay_style(&lower) {
+                        self.report.add_css_overlay(&format!(
+                            "inline style on <{}>: {}",
+                            tag,
+                            &value[..value.len().min(300)]
+                        ));
+                    }
                 }
             }
         }
@@ -189,6 +198,29 @@ impl<'a> Sanitizer<'a> {
             detach(node);
         }
     }
+}
+
+// ── Overlay detection ─────────────────────────────────────────────────────────
+
+/// Returns true when an inline `style` value describes a fullscreen fixed-
+/// position overlay — the structural signature of ClickFix and SocGholish
+/// injections.
+///
+/// Requires all three: `position:fixed`, full viewport width, full viewport
+/// height.  The combination is specific enough that the false-positive rate
+/// on legitimate sites is very low (cookie banners use fixed+full-width but
+/// never full-height; modals rarely use 100vw+100vh inline).
+fn is_fullscreen_overlay_style(lower: &str) -> bool {
+    let has_fixed = lower.contains("position:fixed") || lower.contains("position: fixed");
+    let has_full_width = lower.contains("width:100%")
+        || lower.contains("width: 100%")
+        || lower.contains("width:100vw")
+        || lower.contains("width: 100vw");
+    let has_full_height = lower.contains("height:100%")
+        || lower.contains("height: 100%")
+        || lower.contains("height:100vh")
+        || lower.contains("height: 100vh");
+    has_fixed && has_full_width && has_full_height
 }
 
 // ── URL safety check ──────────────────────────────────────────────────────────

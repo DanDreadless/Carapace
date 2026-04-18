@@ -4,30 +4,35 @@
 <img src="images/Carapace_logo.png" width="400" alt="Carapace" border-radius=50%>
 </p>
 
-Safe HTML/CSS/JS renderer for security researchers. Carapace fetches a URL, sanitises the page, and renders it to a PNG — without executing JavaScript, loading external resources, or making any network requests from the browser. A threat report is produced alongside every render.
+Safe HTML/CSS/JS renderer for security researchers. Carapace fetches a URL, sanitises the page, analyses the JavaScript, and renders it to a PNG — with all outbound network requests intercepted and blocked. A threat report is produced alongside every render.
 
 ---
 
 ## How it works
 
-1. **Fetch** — A hardened Rust HTTP client fetches the URL with SSRF protection and decompression-bomb limits.
-2. **Parse & sanitise** — The HTML is parsed and scrubbed: `<script>` tags, event handlers, `javascript:` URIs, and `data:` URLs are stripped.
-3. **Static JS analysis** — Script content is analysed with an AST walker before removal. Detects eval, obfuscation, exfiltration calls, DOM sinks, and sandbox evasion probes.
-4. **Inline resources** — External stylesheets and images are fetched and inlined as data URIs. External `url()` references in CSS are blocked.
-5. **Render** — A self-contained HTML file (no external dependencies) is handed to Chromium headless with JavaScript disabled and a network kill-switch (`--proxy-server=socks5://127.0.0.1:1`). The browser makes zero network requests.
-6. **Threat report** — All findings are collected into a JSON report written alongside the output.
+1. **Fetch** — A hardened Rust HTTP client (reqwest with HTTP/2 support) fetches the URL with SSRF protection and decompression-bomb limits.
+2. **Parse & sanitise** — The HTML is parsed and scrubbed: `<script>` tags, event handlers, `javascript:` URIs, and `data:` URLs are stripped before the page reaches the browser.
+3. **Static JS analysis** — All collected script content is walked with an AST analyser before removal. Detects eval, obfuscation, exfiltration calls, DOM sinks, and sandbox evasion probes.
+4. **JS sandbox** — For framework-driven pages (React, Vue, Angular, etc.), scripts are executed in an isolated rquickjs runtime. Network APIs are shimmed to log and block all outbound calls.
+5. **Inline resources** — External stylesheets and images are fetched and inlined as data URIs. External `url()` references in CSS are blocked.
+6. **Render** — A self-contained HTML file is handed to Chromium headless with **JavaScript enabled** and all network requests routed through a local logging proxy. The proxy records every URL the page attempts to reach and immediately rejects the connection — no data leaves the machine. This allows dynamic overlays (ClickFix, SocGholish, ClearFake, drainers) to render and be visible in the screenshot.
+7. **Threat report** — All findings from static analysis, the JS sandbox, the CSS overlay detector, and the network intercept log are collected into a JSON report alongside the screenshot.
 
 ---
 
 ## Security model
 
-- JavaScript is fully disabled in Chromium (`--disable-javascript`)
-- All outbound HTTP/HTTPS requests from the browser are killed via a dead SOCKS5 proxy
+- All outbound connections from Chromium are routed through a local logging proxy that immediately rejects every connection — no data ever leaves the machine
+- The proxy records every URL Chromium attempted to reach at runtime; these appear as `INTERCEPTED_REQUEST` findings in the threat report
+- `--disable-blink-features=AutomationControlled` suppresses the `navigator.webdriver` flag so evasive scripts execute their actual attack path rather than a clean scanner path
+- `--virtual-time-budget=3000` allows JS timers up to 3 seconds to fire before the screenshot is taken, catching attacks that delay their overlay to evade scanners
 - Remote fonts are blocked (`--disable-remote-fonts`)
-- CSS `@import`, external `url()`, and `@font-face` are stripped before injection
-- The HTML sanitiser removes every `on*` attribute, `<script>`, `<iframe>`, `<object>`, `<embed>`, and `<form>`
+- CSS `@import`, external `url()`, and `@font-face` are stripped before injection into the browser
+- The HTML sanitiser removes every `on*` attribute, `<script>`, `<iframe>`, `<object>`, `<embed>`, and `<form>` before the page is handed to Chromium
 - SSRF protection blocks private, loopback, and link-local IP ranges at both URL-validation and DNS-resolution time
+- The rquickjs JS sandbox shims `fetch`, `XMLHttpRequest`, and `WebSocket` — all network calls are logged and blocked
 - Docker: runs as a non-root user (uid 1000), all Linux capabilities dropped
+- `wkhtmltoimage` fallback uses `--disable-javascript`
 
 ---
 
@@ -121,7 +126,8 @@ curl http://localhost:8080/health
 ### `POST /render`
 
 ```bash
-curl -s -X POST http://localhost:8080/render -H "Content-Type: application/json" -H "X-API-Key: s3cr3t" -d '{"url":"https://example.com","format":"png"}' | jq -r .output | base64 -d > render.png
+curl -s -X POST http://localhost:8080/render -H "Content-Type: application/json" -H "X-API-Key: s3cr3t" \
+  -d '{"url":"https://example.com","format":"png"}' | jq -r .output | base64 -d > render.png
 ```
 
 **Request body:**
@@ -162,20 +168,47 @@ Every render produces a threat report. When using the CLI it is written to `<out
 ```json
 {
   "url": "https://example.com",
-  "scanned_at": "2026-04-11T14:34:11Z",
+  "scanned_at": "2026-04-18T09:00:00Z",
   "risk_score": 0,
   "framework_detected": "Unknown",
   "tech_stack": [],
   "flags": [],
+  "blocked_network": [],
   "js_flags": [],
   "html_flags": [],
   "drive_by_downloads": []
 }
 ```
 
-**Risk score** is 0–100. Flags from the HTML sanitiser, JS static analysis, and drive-by download detection all contribute to the score.
+**Risk score** is 0–100. Flags from static JS analysis, HTML sanitisation, CSS overlay detection, runtime network interception, and drive-by download detection all contribute to the score.
 
-**JS flags detected:** `eval` calls, `Function()` constructor, `document.write`, dangerous DOM sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`), base64/hex obfuscation, exfiltration (`fetch`, `XMLHttpRequest`, `WebSocket`), cookie writes, `postMessage`, redirect attempts, and sandbox evasion probes (`navigator.webdriver`, screen dimension checks, plugin enumeration, headless string markers).
+**`blocked_network`** is a list of URLs that JavaScript attempted to reach at runtime. All were rejected by the logging proxy — nothing was fetched.
+
+### Flag codes
+
+| Code | Source | Description |
+|------|--------|-------------|
+| `JS_EVAL_DETECTED` | Static / runtime | `eval()` call detected |
+| `JS_FUNCTION_CONSTRUCTOR` | Static / runtime | `new Function(args)` — dynamic code generation (zero-arg form suppressed) |
+| `BASE64_OBFUSCATION` | Static | `atob()` decoding a string literal; decoded value in evidence |
+| `HEX_OBFUSCATION` | Static | High-density `\xNN` hex escape sequences |
+| `INNER_HTML_MUTATION` | Static | Assignment to `innerHTML` / `outerHTML` / `insertAdjacentHTML` |
+| `WEBSOCKET_ATTEMPT` | Static | `new WebSocket()` constructor |
+| `TIMER_STRING_EXEC` | Static | `setTimeout`/`setInterval` called with a string argument |
+| `REDIRECT_ATTEMPT` | Static | Assignment to `window.location` or similar |
+| `DOCUMENT_WRITE` | Static | `document.write()` call |
+| `COOKIE_ACCESS` | Static | Write to `document.cookie` |
+| `CSS_OVERLAY_INJECTED` | CSS analyser | Fullscreen `position:fixed` overlay — ClickFix / SocGholish structural signature |
+| `INTERCEPTED_REQUEST` | Runtime | URLs JavaScript attempted to fetch at runtime (all blocked); list in evidence |
+| `DRIVE_BY_DOWNLOAD` | Fetcher | Automatic file download intercepted (executables/archives only; CSS/fonts/images suppressed) |
+| `SANDBOX_EVASION_WEBDRIVER` | Static | `navigator.webdriver` read — anti-analysis probe |
+| `SANDBOX_EVASION_HEADLESS_STRING` | Static | Headless browser identifier string (`HeadlessChrome`, `PhantomJS`, `$cdc_`) |
+| `SANDBOX_EVASION_SCREEN_PROBE` | Static | `window.outerHeight`/`outerWidth` read — headless detection |
+| `SANDBOX_EVASION_PLUGINS_PROBE` | Static | `navigator.plugins` read — headless detection |
+| `SANDBOX_EVASION_CHROME_RUNTIME` | Static | `window.chrome` / `chrome.runtime` read — automation detection |
+| `SANDBOX_EVASION_FOCUS_PROBE` | Static | `document.hasFocus()` call — headless detection |
+| `EVENT_HANDLER_STRIPPED` | HTML sanitiser | Inline `on*` event handler removed |
+| `META_REDIRECT_STRIPPED` | HTML sanitiser | `<meta http-equiv="refresh">` redirect removed |
 
 ---
 
@@ -189,6 +222,6 @@ Detection covers: React, Vue, Angular, Svelte, Next.js, Nuxt, HTMX, Alpine.js, L
 
 ## Renderer fallback
 
-The primary render path is Chromium headless. If Chromium is not available, Carapace falls back to `wkhtmltoimage`. Both are invoked with JavaScript disabled.
+The primary render path is Chromium headless with JavaScript enabled and a logging network proxy. If Chromium is not available, Carapace falls back to `wkhtmltoimage` with JavaScript disabled.
 
 Pass `--no-browser` to force the built-in Rust renderer (tiny-skia + taffy layout engine). The Rust renderer is approximate — it handles basic CSS box model, flexbox, and inline text but does not support all CSS features. Use it only when no headless browser is available.

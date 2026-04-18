@@ -91,14 +91,20 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
         }
     }
 
+    // ── 4.5. CSS overlay threat analysis ─────────────────────────────────────
+    // Scan collected CSS (both <style> blocks and external sheets) for
+    // fullscreen fixed-position overlays — the structural signature of
+    // ClickFix fake-CAPTCHA and SocGholish browser-update injections.
+    check_css_overlay_threat(&css_sheets, &mut report);
+
     // ── 5. Render ─────────────────────────────────────────────────────────────
     if args.output_format == OutputFormat::Png {
         if args.no_browser {
             // Fallback: built-in Rust renderer (approximate)
             rust_render(args, &page.dom, &css_sheets, &image_bytes, &mut report)?;
         } else {
-            // Primary: headless browser (exact)
-            browser_render(args, &page, &css_sheets, &image_bytes)?;
+            // Primary: headless browser (exact, JS enabled)
+            browser_render(args, &page, &css_sheets, &image_bytes, &mut report)?;
         }
     }
 
@@ -126,6 +132,7 @@ fn browser_render(
     page: &html::ProcessedHtml,
     css_sheets: &[String],
     image_bytes: &HashMap<String, Vec<u8>>,
+    report: &mut ThreatReport,
 ) -> Result<()> {
     // Build a fully self-contained HTML file: inline CSS + images.
     let inliner = HtmlInliner::new(css_sheets.to_vec(), image_bytes.clone());
@@ -146,12 +153,98 @@ fn browser_render(
 
     info!("self-contained HTML written to {} ({} bytes)", tmp_path.display(), self_contained_html.len());
 
-    let result = backend::render_to_png(&tmp_path, &args.output, args.width);
+    let result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height);
 
     // Always clean up the temp file.
     let _ = std::fs::remove_file(&tmp_path);
 
-    result
+    // Surface any URLs that JavaScript attempted to fetch at runtime.
+    // These are requests initiated by the page's JS, not by the static HTML
+    // structure — the pre-inlining means every intercepted URL is evidence
+    // of dynamic network activity (payload retrieval, C2 communication, etc.).
+    if let Ok(ref intercepted) = result {
+        if !intercepted.is_empty() {
+            report.add_intercepted_requests(intercepted);
+        }
+    }
+
+    result.map(|_| ())
+}
+
+// ── CSS overlay threat analysis ───────────────────────────────────────────────
+
+/// Scan CSS (both `<style>` blocks and fetched external sheets) for the
+/// fullscreen-overlay structural pattern used by ClickFix, SocGholish, and
+/// ClearFake injections.
+///
+/// The canonical pattern: `position:fixed` + full viewport width + full
+/// viewport height.  This creates a page-covering layer that blocks all
+/// legitimate content behind a social-engineering prompt.
+fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Match a CSS declaration block (between braces), capturing selector + content.
+    static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+    let block_re = BLOCK_RE.get_or_init(|| {
+        Regex::new(r"(?s)\{([^{}]+)\}").unwrap()
+    });
+
+    static Z_RE: OnceLock<Regex> = OnceLock::new();
+    let z_re = Z_RE.get_or_init(|| Regex::new(r"z-index\s*:\s*(\d+)").unwrap());
+
+    for css in css_sheets {
+        for caps in block_re.captures_iter(css) {
+            let block = &caps[1];
+            let lower = block.to_ascii_lowercase();
+
+            // Must have position:fixed (or position:absolute for off-canvas attacks)
+            let has_fixed = lower.contains("position:fixed")
+                || lower.contains("position: fixed");
+            if !has_fixed {
+                continue;
+            }
+
+            // Must span full viewport width
+            let has_full_width = lower.contains("width:100%")
+                || lower.contains("width: 100%")
+                || lower.contains("width:100vw")
+                || lower.contains("width: 100vw");
+
+            // Must span full viewport height
+            let has_full_height = lower.contains("height:100%")
+                || lower.contains("height: 100%")
+                || lower.contains("height:100vh")
+                || lower.contains("height: 100vh");
+
+            if !has_full_width || !has_full_height {
+                continue;
+            }
+
+            // Optional: capture z-index for evidence quality (not required to fire)
+            let z_index = z_re
+                .captures(&lower)
+                .and_then(|c| c.get(1))
+                .and_then(|m| m.as_str().parse::<u32>().ok());
+
+            // Normalise whitespace for a readable evidence snippet
+            let snippet: String = block
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(300)
+                .collect();
+
+            let detail = match z_index {
+                Some(z) => format!("position:fixed, width:100%/100vw, height:100%/100vh, z-index:{} — {}", z, snippet),
+                None    => format!("position:fixed, width:100%/100vw, height:100%/100vh — {}", snippet),
+            };
+
+            report.add_css_overlay(&detail);
+            return; // one finding per page is sufficient
+        }
+    }
 }
 
 // ── Fallback Rust renderer ────────────────────────────────────────────────────

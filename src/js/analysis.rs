@@ -124,6 +124,21 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             // obj.method() — check for dangerous member calls
             Expression::StaticMemberExpression(member) => {
                 let prop = member.property.name.as_str();
+
+                // document.hasFocus() — always returns false in headless; exclusively
+                // used in anti-bot fingerprinting to detect automated analysis.
+                if prop == "hasFocus" {
+                    if let Expression::Identifier(obj) = &member.object {
+                        if obj.name == "document" {
+                            self.report.add_js_flag(JsFlag::SandboxEvasion {
+                                technique: "focus_probe".into(),
+                                detail: "document.hasFocus() called — always false in headless; used to detect automated analysis environments".into(),
+                                loc: loc.clone(),
+                            });
+                        }
+                    }
+                }
+
                 self.check_member_call(prop, &call.arguments, loc);
             }
 
@@ -248,6 +263,24 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
                         technique: "plugins_probe".into(),
                         detail: "navigator.plugins accessed — headless plugin-list probe".into(),
+                        loc,
+                    });
+                }
+                // window.chrome — undefined in headless Chromium despite the browser being
+                // Chrome-based; anti-bot scripts check for its absence to detect scanners.
+                ("window", "chrome") => {
+                    self.report.add_js_flag(JsFlag::SandboxEvasion {
+                        technique: "chrome_runtime_probe".into(),
+                        detail: "window.chrome accessed — undefined in headless; standard headless-Chrome detection probe".into(),
+                        loc,
+                    });
+                }
+                // chrome.runtime — accessed without the window. prefix.  Near-exclusive
+                // indicator of headless browser detection; no legitimate page content reads this.
+                ("chrome", "runtime") => {
+                    self.report.add_js_flag(JsFlag::SandboxEvasion {
+                        technique: "chrome_runtime_probe".into(),
+                        detail: "chrome.runtime accessed — present in real Chrome extensions, absent in headless; used to detect automated analysis environments".into(),
                         loc,
                     });
                 }
