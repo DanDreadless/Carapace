@@ -104,7 +104,7 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
             rust_render(args, &page.dom, &css_sheets, &image_bytes, &mut report)?;
         } else {
             // Primary: headless browser (exact, JS enabled)
-            browser_render(args, &page, &css_sheets, &image_bytes, &mut report)?;
+            browser_render(args, &page, &base_url, &css_sheets, &image_bytes, &mut report)?;
         }
     }
 
@@ -130,6 +130,7 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
 fn browser_render(
     args: &RenderArgs,
     page: &html::ProcessedHtml,
+    base_url: &url::Url,
     css_sheets: &[String],
     image_bytes: &HashMap<String, Vec<u8>>,
     report: &mut ThreatReport,
@@ -159,12 +160,17 @@ fn browser_render(
     let _ = std::fs::remove_file(&tmp_path);
 
     // Surface any URLs that JavaScript attempted to fetch at runtime.
-    // These are requests initiated by the page's JS, not by the static HTML
-    // structure — the pre-inlining means every intercepted URL is evidence
-    // of dynamic network activity (payload retrieval, C2 communication, etc.).
+    // Filter out same-site requests (own domain / subdomains) — these are
+    // normal WordPress REST API calls, lazy-load fetches, etc. and are not
+    // evidence of C2 communication or payload retrieval.
     if let Ok(ref intercepted) = result {
-        if !intercepted.is_empty() {
-            report.add_intercepted_requests(intercepted);
+        let external: Vec<String> = intercepted
+            .iter()
+            .filter(|u| !is_same_site(&base_url, u))
+            .cloned()
+            .collect();
+        if !external.is_empty() {
+            report.add_intercepted_requests(&external);
         }
     }
 
@@ -218,6 +224,15 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 || lower.contains("height: 100vh");
 
             if !has_full_width || !has_full_height {
+                continue;
+            }
+
+            // Suppress hidden overlays — display:none means this is a standard
+            // modal/dialog that is not currently visible to the visitor.
+            // Active ClickFix/SocGholish overlays are always visible (display:block/flex).
+            let is_hidden = lower.contains("display:none")
+                || lower.contains("display: none");
+            if is_hidden {
                 continue;
             }
 
@@ -467,6 +482,25 @@ fn extract_filename(content_disposition: &str, url: &url::Url) -> String {
     }
 
     "unknown".to_string()
+}
+
+/// Returns `true` when `intercepted_url` belongs to the same site as `base`.
+///
+/// Filters out own-domain requests (WordPress REST API calls, lazy-load XHR,
+/// etc.) that are not evidence of external C2 or payload retrieval.
+/// Matching is done on normalised hostname after stripping a leading `www.`:
+/// subdomains of the base host are also considered same-site.
+fn is_same_site(base: &url::Url, intercepted_url: &str) -> bool {
+    let Ok(iurl) = url::Url::parse(intercepted_url) else { return false };
+    let normalise = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_ascii_lowercase();
+    match (base.host_str(), iurl.host_str()) {
+        (Some(b), Some(i)) => {
+            let bn = normalise(b);
+            let iln = normalise(i);
+            iln == bn || iln.ends_with(&format!(".{}", bn))
+        }
+        _ => false,
+    }
 }
 
 fn rasterise_svg(bytes: &[u8]) -> Option<image::DynamicImage> {
