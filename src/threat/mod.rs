@@ -67,6 +67,11 @@ pub enum JsFlag {
     /// Technique values: `webdriver_check`, `headless_string_probe`,
     /// `screen_dimension_probe`, `plugins_probe`.
     SandboxEvasion { technique: String, detail: String, loc: CodeLocation },
+    /// Fake-CAPTCHA / ClickFix clipboard hijack: JS wrote a string to the
+    /// system clipboard via `navigator.clipboard.writeText` or a `copy`
+    /// event handler with `clipboardData.setData`.
+    /// `method` is one of `"navigator.clipboard.writeText"` or `"copy_event"`.
+    ClipboardWrite { method: String, payload: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +229,23 @@ impl ThreatReport {
                 };
                 self.push_flag(severity, code, detail.clone());
             }
+            JsFlag::ClipboardWrite { method, payload } => {
+                let lower = payload.to_ascii_lowercase();
+                let is_clickfix = [
+                    "curl ", "powershell", " iex", "cmd.exe", "/bin/bash", "bash -c",
+                    "wget ", "python ", "invoke-", "rundll32", "mshta", "certutil",
+                    "regsvr32", "wscript", "cscript", "base64 -d",
+                ]
+                .iter()
+                .any(|kw| lower.contains(kw));
+                let (severity, code) = if is_clickfix {
+                    (Severity::Critical, "CLIPBOARD_HIJACK_CLICKFIX")
+                } else {
+                    (Severity::High, "CLIPBOARD_HIJACK")
+                };
+                let snippet = &payload[..payload.len().min(200)];
+                self.push_flag(severity, code, format!("{} → {:?}", method, snippet));
+            }
             _ => {}
         }
         self.js_flags.push(flag);
@@ -361,6 +383,7 @@ impl ThreatReport {
                     "focus_probe"            => "SANDBOX_EVASION_FOCUS_PROBE",
                     _                        => "SANDBOX_EVASION",
                 },
+                JsFlag::ClipboardWrite { .. } => continue,
                 _ => continue,
             };
             *code_counts.entry(code).or_default() += 1;

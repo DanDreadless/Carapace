@@ -4,6 +4,46 @@ use std::time::{Duration, Instant};
 use rquickjs::{Context, Ctx, Function, Object, Runtime, Value};
 use tracing::{debug, info, warn};
 
+/// Injected before user scripts to set up copy-event handler capture.
+/// Replaces `document.addEventListener` with a version that stores 'copy'
+/// handlers in `window.__cc_copy_handlers__` for the teardown to fire.
+const CLIPBOARD_PREAMBLE: &str = r#"(function(){
+  window.__cc_copy_handlers__=[];
+  var _oa=document.addEventListener;
+  document.addEventListener=function(t,f,o){
+    if(typeof t==='string'&&t==='copy'&&typeof f==='function')
+      window.__cc_copy_handlers__.push(f);
+    if(typeof _oa==='function')_oa(t,f,o);
+  };
+  try{Object.defineProperty(document,'oncopy',{configurable:true,set:function(f){
+    if(typeof f==='function')window.__cc_copy_handlers__.push(f);
+  }});}catch(e){}
+})();"#;
+
+/// Run after all user scripts to synthetically fire a copy event and capture
+/// any payload written via `clipboardData.setData`. Returns a JSON array of
+/// strings (one per handler that called setData with a non-empty value).
+const CLIPBOARD_TEARDOWN: &str = r#"(function(){
+  var r=[];
+  var hs=window.__cc_copy_handlers__||[];
+  hs.forEach(function(h){
+    try{
+      var c=null;
+      var ev={
+        clipboardData:{
+          setData:function(t,v){if(c===null&&typeof v==='string'&&v!=='')c=v;},
+          getData:function(){return '';}
+        },
+        preventDefault:function(){},
+        stopPropagation:function(){}
+      };
+      h(ev);
+      if(c!==null)r.push(c);
+    }catch(e){}
+  });
+  return JSON.stringify(r);
+})();"#;
+
 use crate::error::{CarapaceError, Result};
 use crate::threat::ThreatReport;
 use super::vdom::{new_shared_vdom, SharedVDom, DomSnapshot};
@@ -36,6 +76,9 @@ pub struct SandboxResult {
     pub console_output: Vec<String>,
     pub blocked_globals: Vec<String>,
     pub network_attempts: Vec<String>,
+    /// Clipboard writes intercepted during execution: (method, payload).
+    /// `method` is `"navigator.clipboard.writeText"` or `"copy_event"`.
+    pub clipboard_writes: Vec<(String, String)>,
 }
 
 /// Executes a collection of JS script blocks inside a sandboxed rquickjs
@@ -54,6 +97,7 @@ pub fn run_sandbox(
             console_output: vec![],
             blocked_globals: vec![],
             network_attempts: vec![],
+            clipboard_writes: vec![],
         });
     }
 
@@ -61,6 +105,7 @@ pub fn run_sandbox(
     let console_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let network_attempts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let blocked_globals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let clipboard_writes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let rt = Runtime::new().map_err(|e| CarapaceError::JsRuntime(e.to_string()))?;
     rt.set_memory_limit(limits.max_memory);
@@ -77,10 +122,10 @@ pub fn run_sandbox(
         setup_console(&ctx, &globals, Arc::clone(&console_log))?;
 
         // ── document ──────────────────────────────────────────────────────────
-        setup_document(&ctx, &globals, Arc::clone(&vdom))?;
+        setup_document(&ctx, &globals, Arc::clone(&vdom), Arc::clone(&clipboard_writes))?;
 
         // ── window ────────────────────────────────────────────────────────────
-        setup_window(&ctx, &globals, base_url, Arc::clone(&network_attempts))?;
+        setup_window(&ctx, &globals, base_url, Arc::clone(&network_attempts), Arc::clone(&clipboard_writes))?;
 
         // ── blocked network APIs ──────────────────────────────────────────────
         setup_blocked_network(
@@ -100,18 +145,23 @@ pub fn run_sandbox(
     })
     .map_err(|e| CarapaceError::JsRuntime(e.to_string()))?;
 
+    // Inject preamble first to capture copy event handlers registered by user scripts.
+    let mut all_scripts: Vec<&str> = Vec::with_capacity(scripts.len() + 1);
+    all_scripts.push(CLIPBOARD_PREAMBLE);
+    all_scripts.extend(scripts.iter().map(|s| s.as_str()));
+
     // Execute each script block
     let mut executed = 0;
-    for (i, script) in scripts.iter().enumerate().take(limits.max_scripts) {
+    for (i, script) in all_scripts.iter().enumerate().take(limits.max_scripts) {
         if start.elapsed() >= limits.max_duration {
             warn!("sandbox: CPU budget exceeded after {} scripts", i);
             break;
         }
 
-        debug!("sandbox: executing script block {}/{}", i + 1, scripts.len());
+        debug!("sandbox: executing script block {}/{}", i + 1, all_scripts.len());
 
         let script_result: std::result::Result<(), _> = ctx.with(|ctx| {
-            ctx.eval::<(), _>(script.as_str())
+            ctx.eval::<(), _>(*script)
         });
 
         match script_result {
@@ -127,17 +177,33 @@ pub fn run_sandbox(
 
     info!("sandbox: executed {}/{} script blocks", executed, scripts.len());
 
+    // Fire synthetic copy event to capture any registered copy event handlers.
+    let event_writes: Vec<String> = ctx.with(|ctx| -> Vec<String> {
+        ctx.eval::<String, _>(CLIPBOARD_TEARDOWN)
+            .ok()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+            .unwrap_or_default()
+    });
+    {
+        let mut cw = clipboard_writes.lock().unwrap();
+        for payload in event_writes {
+            cw.push(("copy_event".to_string(), payload));
+        }
+    }
+
     // Extract DOM snapshot
     let dom_snapshot = vdom.lock().unwrap().snapshot();
     let console_output = console_log.lock().unwrap().clone();
     let network_attempts = network_attempts.lock().unwrap().clone();
     let blocked_globals = blocked_globals.lock().unwrap().clone();
+    let clipboard_writes = clipboard_writes.lock().unwrap().clone();
 
     Ok(SandboxResult {
         dom_snapshot,
         console_output,
         blocked_globals,
         network_attempts,
+        clipboard_writes,
     })
 }
 
@@ -181,6 +247,7 @@ fn setup_document<'js>(
     ctx: &Ctx<'js>,
     globals: &Object<'js>,
     vdom: SharedVDom,
+    clipboard_writes: Arc<Mutex<Vec<(String, String)>>>,
 ) -> std::result::Result<(), rquickjs::Error> {
     let doc = Object::new(ctx.clone())?;
 
@@ -226,10 +293,26 @@ fn setup_document<'js>(
     // document.cookie — getter returns empty string; setter is logged
     doc.set("cookie", "")?;
 
-    // document.addEventListener — no-op
+    // document.addEventListener — no-op (copy event handlers are captured via JS preamble)
     {
         let noop = Function::new(ctx.clone(), |_event: String, _handler: Value| {})?;
         doc.set("addEventListener", noop)?;
+    }
+
+    // document.execCommand — flag copy commands; other commands are no-ops.
+    // Content capture is not possible without DOM selection, but detection
+    // of the copy intent is valuable as a corroborating ClickFix signal.
+    {
+        let cw = Arc::clone(&clipboard_writes);
+        let exec_command = Function::new(ctx.clone(), move |cmd: Option<String>, _show: Value, _val: Value| -> bool {
+            let cmd = cmd.unwrap_or_default();
+            if cmd.to_ascii_lowercase() == "copy" {
+                warn!("sandbox: document.execCommand('copy') intercepted");
+                cw.lock().unwrap().push(("document.execCommand".to_string(), String::new()));
+            }
+            true
+        })?;
+        doc.set("execCommand", exec_command)?;
     }
 
     // document.__snapshot__ — internal API to extract the VDom
@@ -251,6 +334,7 @@ fn setup_window<'js>(
     globals: &Object<'js>,
     base_url: &str,
     _network_log: Arc<Mutex<Vec<String>>>,
+    clipboard_writes: Arc<Mutex<Vec<(String, String)>>>,
 ) -> std::result::Result<(), rquickjs::Error> {
     let window = Object::new(ctx.clone())?;
 
@@ -268,6 +352,24 @@ fn setup_window<'js>(
     navigator.set("languages", vec!["en-US", "en"])?;
     navigator.set("cookieEnabled", false)?;
     navigator.set("onLine", false)?;
+
+    // navigator.clipboard — intercept writeText to capture ClickFix payloads
+    {
+        let clipboard_obj = Object::new(ctx.clone())?;
+        let cw = Arc::clone(&clipboard_writes);
+        let write_text = Function::new(ctx.clone(), move |text: String| {
+            debug!("sandbox: navigator.clipboard.writeText intercepted ({} bytes)", text.len());
+            cw.lock().unwrap().push(("navigator.clipboard.writeText".to_string(), text));
+        })?;
+        clipboard_obj.set("writeText", write_text)?;
+        // readText returns a resolved empty promise stub
+        let read_text = Function::new(ctx.clone(), || -> String { String::new() })?;
+        clipboard_obj.set("readText", read_text)?;
+        navigator.set("clipboard", clipboard_obj)?;
+    }
+
+    // Expose navigator as a top-level global so pages can access it without `window.`
+    globals.set("navigator", navigator.clone())?;
     window.set("navigator", navigator)?;
 
     // window.screen

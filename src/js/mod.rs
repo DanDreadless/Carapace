@@ -79,6 +79,17 @@ impl JsProcessor {
                 report.add_blocked_network(url.clone());
             }
 
+            // Record clipboard writes — the payload delivery vector in ClickFix attacks.
+            // Skip empty-payload entries (e.g. bare execCommand detections with no content).
+            for (method, payload) in &sandbox_result.clipboard_writes {
+                if !payload.is_empty() {
+                    report.add_js_flag(crate::threat::JsFlag::ClipboardWrite {
+                        method: method.clone(),
+                        payload: payload.clone(),
+                    });
+                }
+            }
+
             return Ok(JsOutput {
                 dom_snapshot: Some(sandbox_result.dom_snapshot),
                 console_output: sandbox_result.console_output,
