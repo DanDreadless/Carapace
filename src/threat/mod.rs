@@ -185,14 +185,27 @@ impl ThreatReport {
                 self.push_flag(Severity::Critical, "JS_EVAL_DETECTED", "eval() call".into());
             }
             JsFlag::FunctionConstructor { arg, .. } => {
-                let detail = match arg {
+                match arg {
                     Some(body) => {
+                        // Literal body — analyst has the evidence to assess intent.
                         let snippet = &body[..body.len().min(120)];
-                        format!("new Function({:?})", snippet)
+                        self.push_flag(
+                            Severity::High,
+                            "JS_FUNCTION_CONSTRUCTOR",
+                            format!("new Function({:?})", snippet),
+                        );
                     }
-                    None => "new Function(<non-literal body>)".into(),
-                };
-                self.push_flag(Severity::Critical, "JS_FUNCTION_CONSTRUCTOR", detail);
+                    None => {
+                        // Dynamic/non-literal body — we cannot see what will be executed.
+                        // Flag at MEDIUM; CRITICAL requires corroborating obfuscation signals
+                        // (e.g. BASE64_OBFUSCATION) which the scorer can collapse.
+                        self.push_flag(
+                            Severity::Medium,
+                            "JS_FUNCTION_CONSTRUCTOR_DYNAMIC",
+                            "new Function(<dynamic expression>)".into(),
+                        );
+                    }
+                }
             }
             JsFlag::Base64Obfuscation(d) => {
                 let orig = &d.original[..d.original.len().min(40)];
@@ -371,7 +384,9 @@ impl ThreatReport {
         for f in &self.js_flags {
             let code = match f {
                 JsFlag::EvalCall(_) => "JS_EVAL_DETECTED",
-                JsFlag::FunctionConstructor { .. } => "JS_FUNCTION_CONSTRUCTOR",
+                JsFlag::FunctionConstructor { arg, .. } => {
+                    if arg.is_some() { "JS_FUNCTION_CONSTRUCTOR" } else { "JS_FUNCTION_CONSTRUCTOR_DYNAMIC" }
+                }
                 JsFlag::Base64Obfuscation(_) => "BASE64_OBFUSCATION",
                 JsFlag::HexObfuscation(_) => "HEX_OBFUSCATION",
                 JsFlag::NetworkCall(_) => "NETWORK_ATTEMPT_BLOCKED",
