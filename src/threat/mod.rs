@@ -158,11 +158,17 @@ impl ThreatReport {
             }
             HtmlFlag::BlockedAttribute { element, attr, value } => {
                 if attr.starts_with("on") {
-                    self.push_flag(
-                        Severity::High,
-                        "EVENT_HANDLER_STRIPPED",
-                        format!("{}={:?} on <{}>", attr, value, element),
-                    );
+                    // <link onload="..."> is the standard async CSS loading idiom
+                    // (this.onload=null;this.rel='stylesheet') — not a script execution vector.
+                    if element == "link" && attr == "onload" {
+                        // still record in html_flags for audit trail, but don't push a finding
+                    } else {
+                        self.push_flag(
+                            Severity::High,
+                            "EVENT_HANDLER_STRIPPED",
+                            format!("{}={:?} on <{}>", attr, value, element),
+                        );
+                    }
                 } else {
                     self.push_flag(
                         Severity::Medium,

@@ -199,6 +199,9 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
     static Z_RE: OnceLock<Regex> = OnceLock::new();
     let z_re = Z_RE.get_or_init(|| Regex::new(r"z-index\s*:\s*(\d+)").unwrap());
 
+    static OPACITY_RE: OnceLock<Regex> = OnceLock::new();
+    let opacity_re = OPACITY_RE.get_or_init(|| Regex::new(r"opacity\s*:\s*0?\.[0-9]").unwrap());
+
     for css in css_sheets {
         for caps in block_re.captures_iter(css) {
             let block = &caps[1];
@@ -227,12 +230,21 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
-            // Suppress hidden overlays — display:none means this is a standard
-            // modal/dialog that is not currently visible to the visitor.
-            // Active ClickFix/SocGholish overlays are always visible (display:block/flex).
+            // Suppress hidden overlays — display:none and visibility:hidden both
+            // indicate a modal/dialog that is not currently visible to the visitor.
+            // Active ClickFix/SocGholish overlays are always visible.
             let is_hidden = lower.contains("display:none")
-                || lower.contains("display: none");
+                || lower.contains("display: none")
+                || lower.contains("visibility:hidden")
+                || lower.contains("visibility: hidden");
             if is_hidden {
+                continue;
+            }
+
+            // Suppress semi-transparent backdrops (modal/lightbox backgrounds).
+            // ClickFix/SocGholish overlays must fully obscure the page — they never
+            // use fractional opacity. opacity:.N or opacity:0.N is a modal backdrop.
+            if opacity_re.is_match(&lower) {
                 continue;
             }
 
