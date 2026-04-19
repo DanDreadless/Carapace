@@ -202,6 +202,14 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
     static OPACITY_RE: OnceLock<Regex> = OnceLock::new();
     let opacity_re = OPACITY_RE.get_or_init(|| Regex::new(r"opacity\s*:\s*0?\.[0-9]").unwrap());
 
+    // rgba() with fractional alpha — e.g. rgba(0,0,0,.7) or rgba(0,0,0,0.5).
+    // A ClickFix overlay needs to fully obscure the page; any rgba() alpha < 1
+    // means the overlay is a semi-transparent modal backdrop, not an attack layer.
+    static RGBA_BACKDROP_RE: OnceLock<Regex> = OnceLock::new();
+    let rgba_backdrop_re = RGBA_BACKDROP_RE.get_or_init(|| {
+        Regex::new(r"rgba\s*\([^)]*,\s*0?\.[0-9]").unwrap()
+    });
+
     for css in css_sheets {
         for caps in block_re.captures_iter(css) {
             let block = &caps[1];
@@ -243,8 +251,10 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
 
             // Suppress semi-transparent backdrops (modal/lightbox backgrounds).
             // ClickFix/SocGholish overlays must fully obscure the page — they never
-            // use fractional opacity. opacity:.N or opacity:0.N is a modal backdrop.
-            if opacity_re.is_match(&lower) {
+            // use fractional opacity. Covers both:
+            //   opacity:.N / opacity:0.N  — CSS opacity property
+            //   rgba(r,g,b,.N)            — alpha embedded in background-color
+            if opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower) {
                 continue;
             }
 
@@ -269,6 +279,21 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 if z < 1000 {
                     continue;
                 }
+            }
+
+            // Require the overlay to have a visible background OR a high z-index.
+            // A ClickFix overlay must visually present itself to the visitor — an
+            // element with no background colour is invisible and cannot socially
+            // engineer anyone.  Bare structural rules (position + size only) are
+            // utility base classes from popup/slider plugins, not attack surfaces.
+            let has_background = lower.contains("background")
+                && !lower.contains("background:none")
+                && !lower.contains("background: none")
+                && !lower.contains("background:transparent")
+                && !lower.contains("background: transparent");
+            let has_high_z = z_index.map_or(false, |z| z >= 1000);
+            if !has_background && !has_high_z {
+                continue;
             }
 
             // Normalise whitespace for a readable evidence snippet
