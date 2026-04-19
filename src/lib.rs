@@ -273,20 +273,14 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
             }
 
             // Suppress semi-transparent backdrops (modal/lightbox backgrounds)
-            // ONLY when z-index is in the normal popup range (< 100000).
-            //
-            // Low-z-index rgba() overlays are standard modal curtains — Magnific
-            // Popup, WooCommerce lightboxes, cookie banners all use this pattern.
-            //
-            // High-z-index rgba() overlays (z >= 100000) are NOT suppressed:
-            // ClickFix "locked screen" attacks use a dark rgba() backdrop at extreme
-            // z-index to obscure real page content — z-index 1999992, 999999, etc.
-            // A popup plugin never needs a z-index in the millions.
-            let is_low_z_backdrop = match z_index {
-                None    => opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower),
-                Some(z) => z < 100_000 && (opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower)),
-            };
-            if is_low_z_backdrop {
+            // at any z-index. Plugins like WP Popup Maker legitimately use extreme
+            // z-index values (e.g. 1999992) for their backdrop layer. A partially-
+            // transparent rgba() overlay cannot fully obscure page content regardless
+            // of z-index — it dims rather than hides. ClickFix attacks that rely on
+            // social engineering need to fully block the page; a 70% opacity backdrop
+            // alone does not accomplish that.
+            let is_backdrop = opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower);
+            if is_backdrop {
                 continue;
             }
 
