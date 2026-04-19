@@ -163,8 +163,18 @@ impl ThreatReport {
                     if element == "link" && attr == "onload" {
                         // still record in html_flags for audit trail, but don't push a finding
                     } else {
+                        // Auto-firing handlers (onload, onerror, onbeforeunload) execute
+                        // without any user interaction — HIGH. User-interaction handlers
+                        // (onclick, onmouseover, etc.) require the visitor to act — MEDIUM.
+                        let auto_firing = matches!(
+                            attr.as_str(),
+                            "onload" | "onerror" | "onbeforeunload" | "onunload"
+                                | "onfocusin" | "onpageshow" | "onpagehide"
+                                | "onreadystatechange" | "onanimationend"
+                        );
+                        let severity = if auto_firing { Severity::High } else { Severity::Medium };
                         self.push_flag(
-                            Severity::High,
+                            severity,
                             "EVENT_HANDLER_STRIPPED",
                             format!("{}={:?} on <{}>", attr, value, element),
                         );
@@ -231,7 +241,7 @@ impl ThreatReport {
                 self.push_flag(Severity::Medium, "REDIRECT_ATTEMPT", format!("→ {}", url));
             }
             JsFlag::DangerousSink(m) => {
-                self.push_flag(Severity::High, "INNER_HTML_MUTATION", format!("{} sink", m.sink));
+                self.push_flag(Severity::Medium, "INNER_HTML_MUTATION", format!("{} sink", m.sink));
             }
             JsFlag::DocumentWrite(_) => {
                 self.push_flag(Severity::Medium, "DOCUMENT_WRITE", "document.write()".into());

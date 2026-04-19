@@ -248,11 +248,28 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
-            // Optional: capture z-index for evidence quality (not required to fire)
+            // Suppress non-interactive overlays — pointer-events:none means the
+            // element passes all mouse events through to underlying content.
+            // A ClickFix overlay must capture clicks to socially engineer the visitor;
+            // an overlay that cannot receive pointer events is decorative only.
+            if lower.contains("pointer-events:none") || lower.contains("pointer-events: none") {
+                continue;
+            }
+
+            // Capture z-index — used both for filtering and evidence quality.
+            // ClickFix/SocGholish overlays use z-index in the 1000s–100000s range
+            // to guarantee they sit above all page content. Navigation headers,
+            // hero sections, and site-builder overlays typically use z-index < 1000.
+            // Require z-index >= 1000 to fire, or fire on overlays with no z-index.
             let z_index = z_re
                 .captures(&lower)
                 .and_then(|c| c.get(1))
                 .and_then(|m| m.as_str().parse::<u32>().ok());
+            if let Some(z) = z_index {
+                if z < 1000 {
+                    continue;
+                }
+            }
 
             // Normalise whitespace for a readable evidence snippet
             let snippet: String = block
