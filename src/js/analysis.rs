@@ -63,6 +63,28 @@ impl SecurityVisitor<'_> {
             "postMessage" => {
                 self.report.add_js_flag(JsFlag::PostMessage(loc));
             }
+            // navigator.clipboard.writeText(payload) — the modern ClickFix
+            // clipboard write API.  The payload string (if a literal) is
+            // captured so the threat report can surface it as evidence.
+            "writeText" => {
+                let payload = first_string_arg(args).unwrap_or_default();
+                self.report.add_js_flag(JsFlag::ClipboardWrite {
+                    method: "navigator.clipboard.writeText".into(),
+                    payload,
+                });
+            }
+            // document.execCommand('copy') — the legacy ClickFix clipboard
+            // write path used on older WordPress compromise toolkits.
+            "execCommand" => {
+                if let Some(cmd) = first_string_arg(args) {
+                    if cmd.eq_ignore_ascii_case("copy") {
+                        self.report.add_js_flag(JsFlag::ClipboardWrite {
+                            method: "document.execCommand(copy)".into(),
+                            payload: String::new(),
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -336,6 +358,33 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             }
         }
 
+        // WebGL canvas fingerprinting — used by phishing kits (Tycoon2FA, others)
+        // to detect automated analysis environments before serving the phishing page.
+        // WEBGL_debug_renderer_info is a WebGL extension that exposes GPU vendor and
+        // renderer strings — information that differs between real browsers and headless
+        // Chromium. No legitimate page functionality requires this extension; it appears
+        // exclusively in fingerprinting/bot-detection code.
+        // UNMASKED_RENDERER_WEBGL / UNMASKED_VENDOR_WEBGL are the constants within
+        // that extension used to read the actual GPU identifiers.
+        const CANVAS_FINGERPRINT_MARKERS: &[&str] = &[
+            "WEBGL_debug_renderer_info",
+            "UNMASKED_RENDERER_WEBGL",
+            "UNMASKED_VENDOR_WEBGL",
+        ];
+        for &marker in CANVAS_FINGERPRINT_MARKERS {
+            if val.contains(marker) {
+                self.report.add_js_flag(JsFlag::SandboxEvasion {
+                    technique: "canvas_fingerprint_probe".into(),
+                    detail: format!(
+                        "WebGL fingerprinting string {:?} — used to detect headless/automated browsers via GPU identifier",
+                        marker
+                    ),
+                    loc: self.loc(lit.span.start),
+                });
+                break;
+            }
+        }
+
         // StringLiteral has no children — no walk needed.
     }
 }
@@ -495,6 +544,22 @@ mod tests {
         let report = run("if (navigator.plugins.length === 0) { redirect(); }");
         assert!(report.js_flags().iter().any(|f| matches!(
             f, JsFlag::SandboxEvasion { technique, .. } if technique == "plugins_probe"
+        )));
+    }
+
+    #[test]
+    fn detects_clipboard_write_text() {
+        let report = run(r#"navigator.clipboard.writeText("powershell -enc ABC")"#);
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::ClipboardWrite { method, .. } if method == "navigator.clipboard.writeText"
+        )));
+    }
+
+    #[test]
+    fn detects_execcommand_copy() {
+        let report = run(r#"document.execCommand('copy')"#);
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::ClipboardWrite { method, .. } if method == "document.execCommand(copy)"
         )));
     }
 }

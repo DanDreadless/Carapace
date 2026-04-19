@@ -33,16 +33,40 @@ impl HtmlInliner {
         // Pass 1 – remove <link rel="stylesheet"> and replace <img src> with data URIs.
         self.process_subtree(&dom.document);
 
-        // Pass 2 – sanitise and inject <style> blocks into <head>.
-        // sanitize_css_for_browser strips @import, external url(), and @font-face
-        // so Chromium cannot use CSS to make outbound network requests.
+        // Pass 2 – sanitise and inject <style> blocks into <head>, plus a
+        // Windows platform bootstrap script as the very first child of <head>.
+        //
+        // The bootstrap script overrides navigator.platform to 'Win32' so that
+        // ClickFix and SocGholish payloads that gate on OS fingerprinting
+        // (e.g. `if (navigator.platform === 'Win32')`) believe they are
+        // running on a Windows host and execute their full attack path.
+        // Combined with the --user-agent Chromium flag (which makes
+        // navigator.userAgent report Windows Chrome), this causes the complete
+        // ClickFix delivery chain to run and become visible to Carapace's
+        // DOM-level analysis.
+        //
+        // Security note: the injected script runs entirely inside the sandboxed
+        // Chromium render with all network requests blocked by the logging proxy.
+        // No data can reach an external host regardless of what the page does.
         if let Some(head) = find_element(&dom.document, "head") {
+            const WINDOWS_BOOTSTRAP: &str = r#"
+(function() {
+  try {
+    Object.defineProperty(navigator, 'platform',    {get: function() { return 'Win32'; }});
+    Object.defineProperty(navigator, 'oscpu',       {get: function() { return 'Windows NT 10.0; Win64; x64'; }});
+    Object.defineProperty(navigator, 'appVersion',  {get: function() { return '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'; }});
+  } catch(e) {}
+})();
+"#;
+            let bootstrap = make_script_node(WINDOWS_BOOTSTRAP);
+            head.children.borrow_mut().insert(0, bootstrap);
+
             for css in &self.css_sheets {
                 let safe_css = sanitize_css_for_browser(css);
                 let style = make_style_node(&safe_css);
                 head.children.borrow_mut().push(style);
             }
-            debug!("injected {} CSS sheets into <head> (external URLs stripped)", self.css_sheets.len());
+            debug!("injected {} CSS sheets + Windows bootstrap into <head>", self.css_sheets.len());
         }
 
         // Pass 3 – serialise.
@@ -142,6 +166,21 @@ fn find_element(handle: &Handle, tag_name: &str) -> Option<Handle> {
         }
     }
     None
+}
+
+fn make_script_node(js: &str) -> Handle {
+    let name = QualName::new(None, ns!(html), LocalName::from("script"));
+    let script = Node::new(NodeData::Element {
+        name,
+        attrs: RefCell::new(vec![]),
+        template_contents: RefCell::new(None),
+        mathml_annotation_xml_integration_point: false,
+    });
+    let text = Node::new(NodeData::Text {
+        contents: RefCell::new(js.into()),
+    });
+    script.children.borrow_mut().push(text);
+    script
 }
 
 fn make_style_node(css: &str) -> Handle {

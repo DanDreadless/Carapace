@@ -71,7 +71,11 @@ impl SafeFetcher {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(options.timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .user_agent("Carapace/0.1 (SecurityRenderer)")
+            // Mimic a real Windows Chrome browser so that servers performing
+            // User-Agent fingerprinting serve their real content (including
+            // conditional malicious payloads like ClickFix overlays) rather
+            // than a bot-safe clean page.
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
             .build()?;
 
         Ok(Self { client, options })

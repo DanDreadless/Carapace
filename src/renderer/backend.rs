@@ -276,6 +276,12 @@ fn render_chromium(
             // automation indicators so that evasive scripts actually execute
             // their attack path rather than their clean-for-scanner path.
             "--disable-blink-features=AutomationControlled",
+            // Spoof a Windows 10 Chrome user-agent so that ClickFix, SocGholish,
+            // and other Windows-targeted campaigns see a plausible victim browser
+            // rather than a Linux headless instance and skip their delivery logic.
+            // navigator.platform is overridden in the injected bootstrap script
+            // (see HtmlInliner::build_self_contained) for JS-level OS checks.
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             // Memory safety: constrain JS heap to reduce DoS risk from
             // malicious pages with infinite loops or large allocations.
             "--memory-model=low",
