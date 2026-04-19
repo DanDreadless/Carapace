@@ -249,15 +249,6 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
-            // Suppress semi-transparent backdrops (modal/lightbox backgrounds).
-            // ClickFix/SocGholish overlays must fully obscure the page — they never
-            // use fractional opacity. Covers both:
-            //   opacity:.N / opacity:0.N  — CSS opacity property
-            //   rgba(r,g,b,.N)            — alpha embedded in background-color
-            if opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower) {
-                continue;
-            }
-
             // Suppress non-interactive overlays — pointer-events:none means the
             // element passes all mouse events through to underlying content.
             // A ClickFix overlay must capture clicks to socially engineer the visitor;
@@ -279,6 +270,24 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 if z < 1000 {
                     continue;
                 }
+            }
+
+            // Suppress semi-transparent backdrops (modal/lightbox backgrounds)
+            // ONLY when z-index is in the normal popup range (< 100000).
+            //
+            // Low-z-index rgba() overlays are standard modal curtains — Magnific
+            // Popup, WooCommerce lightboxes, cookie banners all use this pattern.
+            //
+            // High-z-index rgba() overlays (z >= 100000) are NOT suppressed:
+            // ClickFix "locked screen" attacks use a dark rgba() backdrop at extreme
+            // z-index to obscure real page content — z-index 1999992, 999999, etc.
+            // A popup plugin never needs a z-index in the millions.
+            let is_low_z_backdrop = match z_index {
+                None    => opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower),
+                Some(z) => z < 100_000 && (opacity_re.is_match(&lower) || rgba_backdrop_re.is_match(&lower)),
+            };
+            if is_low_z_backdrop {
+                continue;
             }
 
             // Require the overlay to have a visible background OR a high z-index.
