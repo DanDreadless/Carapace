@@ -212,15 +212,24 @@ impl<'a> Sanitizer<'a> {
 /// never full-height; modals rarely use 100vw+100vh inline).
 fn is_fullscreen_overlay_style(lower: &str) -> bool {
     let has_fixed = lower.contains("position:fixed") || lower.contains("position: fixed");
-    let has_full_width = lower.contains("width:100%")
-        || lower.contains("width: 100%")
+    // Use standalone_prop() to avoid false-matching max-width:100% / min-width:100%
+    let has_full_width = crate::standalone_prop(lower, "width:100%")
+        || crate::standalone_prop(lower, "width: 100%")
         || lower.contains("width:100vw")
         || lower.contains("width: 100vw");
-    let has_full_height = lower.contains("height:100%")
-        || lower.contains("height: 100%")
+    let has_full_height = crate::standalone_prop(lower, "height:100%")
+        || crate::standalone_prop(lower, "height: 100%")
         || lower.contains("height:100vh")
         || lower.contains("height: 100vh");
-    has_fixed && has_full_width && has_full_height
+    // Slide-in drawers / off-canvas menus use position:fixed + full-height
+    // but are translated off-screen — they are never visible to the visitor.
+    let is_offscreen = lower.contains("translate3d(-100%")
+        || lower.contains("translate3d(100%")
+        || lower.contains("translatex(-100%")
+        || lower.contains("translatex(100%")
+        || lower.contains("translate(-100%,")
+        || lower.contains("translate(100%,");
+    has_fixed && has_full_width && has_full_height && !is_offscreen
 }
 
 // ── URL safety check ──────────────────────────────────────────────────────────

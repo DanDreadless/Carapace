@@ -255,13 +255,14 @@ impl ThreatReport {
             }
             JsFlag::SandboxEvasion { technique, detail, .. } => {
                 let (severity, code) = match technique.as_str() {
-                    "webdriver_check"        => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
-                    "headless_string_probe"  => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
-                    "screen_dimension_probe" => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
-                    "plugins_probe"          => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
-                    "chrome_runtime_probe"   => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
-                    "focus_probe"            => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
-                    _                        => (Severity::Medium,  "SANDBOX_EVASION"),
+                    "webdriver_check"          => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
+                    "headless_string_probe"    => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
+                    "screen_dimension_probe"   => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
+                    "plugins_probe"            => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
+                    "chrome_runtime_probe"     => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
+                    "focus_probe"              => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
+                    "canvas_fingerprint_probe" => (Severity::High,   "SANDBOX_EVASION_CANVAS_FINGERPRINT"),
+                    _                          => (Severity::Medium,  "SANDBOX_EVASION"),
                 };
                 self.push_flag(severity, code, detail.clone());
             }
@@ -413,13 +414,14 @@ impl ThreatReport {
                 JsFlag::CookieWrite(_) => "COOKIE_ACCESS",
                 JsFlag::TimerWithString { .. } => "TIMER_STRING_EXEC",
                 JsFlag::SandboxEvasion { technique, .. } => match technique.as_str() {
-                    "webdriver_check"        => "SANDBOX_EVASION_WEBDRIVER",
-                    "headless_string_probe"  => "SANDBOX_EVASION_HEADLESS_STRING",
-                    "screen_dimension_probe" => "SANDBOX_EVASION_SCREEN_PROBE",
-                    "plugins_probe"          => "SANDBOX_EVASION_PLUGINS_PROBE",
-                    "chrome_runtime_probe"   => "SANDBOX_EVASION_CHROME_RUNTIME",
-                    "focus_probe"            => "SANDBOX_EVASION_FOCUS_PROBE",
-                    _                        => "SANDBOX_EVASION",
+                    "webdriver_check"          => "SANDBOX_EVASION_WEBDRIVER",
+                    "headless_string_probe"    => "SANDBOX_EVASION_HEADLESS_STRING",
+                    "screen_dimension_probe"   => "SANDBOX_EVASION_SCREEN_PROBE",
+                    "plugins_probe"            => "SANDBOX_EVASION_PLUGINS_PROBE",
+                    "chrome_runtime_probe"     => "SANDBOX_EVASION_CHROME_RUNTIME",
+                    "focus_probe"              => "SANDBOX_EVASION_FOCUS_PROBE",
+                    "canvas_fingerprint_probe" => "SANDBOX_EVASION_CANVAS_FINGERPRINT",
+                    _                          => "SANDBOX_EVASION",
                 },
                 JsFlag::ClipboardWrite { .. } => continue,
                 _ => continue,

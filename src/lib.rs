@@ -179,6 +179,29 @@ fn browser_render(
 
 // ── CSS overlay threat analysis ───────────────────────────────────────────────
 
+/// Returns true when `needle` appears in `haystack` as a standalone CSS
+/// property — i.e. not as a suffix of another property name such as
+/// `max-width` or `min-width`.  The character immediately before the match
+/// must be a semicolon, ASCII whitespace, or the start of the string; a
+/// hyphen or letter indicates the match is part of a longer property name.
+pub(crate) fn standalone_prop(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nlen = needle.len();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let prev_ok = abs == 0 || {
+            let b = bytes[abs - 1];
+            b == b';' || b.is_ascii_whitespace()
+        };
+        if prev_ok {
+            return true;
+        }
+        start = abs + nlen;
+    }
+    false
+}
+
 /// Scan CSS (both `<style>` blocks and fetched external sheets) for the
 /// fullscreen-overlay structural pattern used by ClickFix, SocGholish, and
 /// ClearFake injections.
@@ -222,19 +245,36 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
-            // Must span full viewport width
-            let has_full_width = lower.contains("width:100%")
-                || lower.contains("width: 100%")
+            // Must span full viewport width.
+            // Use standalone_prop() to avoid matching max-width:100% or
+            // min-width:100% — both contain "width:100%" as a substring
+            // but represent a capped width, not a full-viewport width.
+            let has_full_width = standalone_prop(&lower, "width:100%")
+                || standalone_prop(&lower, "width: 100%")
                 || lower.contains("width:100vw")
                 || lower.contains("width: 100vw");
 
             // Must span full viewport height
-            let has_full_height = lower.contains("height:100%")
-                || lower.contains("height: 100%")
+            let has_full_height = standalone_prop(&lower, "height:100%")
+                || standalone_prop(&lower, "height: 100%")
                 || lower.contains("height:100vh")
                 || lower.contains("height: 100vh");
 
             if !has_full_width || !has_full_height {
+                continue;
+            }
+
+            // Suppress off-screen overlays — an element translated completely
+            // off-screen (translate3d(±100%,...) or translateX(±100%)) is a
+            // slide-in drawer or off-canvas menu, not a visible attack overlay.
+            // ClickFix / SocGholish overlays are always fully on-screen.
+            let is_offscreen = lower.contains("translate3d(-100%")
+                || lower.contains("translate3d(100%")
+                || lower.contains("translatex(-100%")
+                || lower.contains("translatex(100%")
+                || lower.contains("translate(-100%,")
+                || lower.contains("translate(100%,");
+            if is_offscreen {
                 continue;
             }
 
@@ -284,18 +324,22 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
-            // Require the overlay to have a visible background OR a high z-index.
-            // A ClickFix overlay must visually present itself to the visitor — an
-            // element with no background colour is invisible and cannot socially
-            // engineer anyone.  Bare structural rules (position + size only) are
-            // utility base classes from popup/slider plugins, not attack surfaces.
+            // Require the overlay to have a visible background colour.
+            // A ClickFix / SocGholish overlay must visually present a fake prompt
+            // to the visitor — it cannot socially engineer anyone if it has no
+            // background (a transparent fixed layer is invisible).  GDPR cookie
+            // consent banners (Complianz, CookieYes, Borlabs) use the same
+            // position:fixed + full-viewport structure but put the background colour
+            // on an inner content element, leaving the outer container transparent.
+            // Requiring an explicit background here eliminates these false positives
+            // while keeping all known real ClickFix / SocGholish patterns (which
+            // always define background or background-color on the overlay element).
             let has_background = lower.contains("background")
                 && !lower.contains("background:none")
                 && !lower.contains("background: none")
                 && !lower.contains("background:transparent")
                 && !lower.contains("background: transparent");
-            let has_high_z = z_index.map_or(false, |z| z >= 1000);
-            if !has_background && !has_high_z {
+            if !has_background {
                 continue;
             }
 

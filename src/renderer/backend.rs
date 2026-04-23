@@ -282,13 +282,14 @@ fn render_chromium(
             // navigator.platform is overridden in the injected bootstrap script
             // (see HtmlInliner::build_self_contained) for JS-level OS checks.
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            // Memory safety: constrain JS heap to reduce DoS risk from
-            // malicious pages with infinite loops or large allocations.
-            "--memory-model=low",
             // Virtual time budget: allow CSS transitions and JS timers up to
-            // 3s to settle before the screenshot is taken — catches attacks
+            // 5s to settle before the screenshot is taken — catches attacks
             // that delay their overlay by a short timeout to evade scanners.
-            "--virtual-time-budget=3000",
+            "--virtual-time-budget=5000",
+            // Ensure all compositor stages (layout, paint, compositing) complete
+            // before the screenshot is captured, preventing blank/partial renders
+            // on slow-rendering pages.
+            "--run-all-compositor-stages-before-draw",
             // Network isolation: route all requests through our logging proxy.
             // It records attempted URLs and immediately rejects connections.
             &proxy_arg,
