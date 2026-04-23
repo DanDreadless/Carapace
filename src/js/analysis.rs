@@ -26,6 +26,7 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
     let mut visitor = SecurityVisitor {
         report,
         source_name: source_name.to_string(),
+        source: source.to_string(),
     };
     visitor.visit_program(&result.program);
 }
@@ -33,6 +34,7 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
 struct SecurityVisitor<'r> {
     report: &'r mut ThreatReport,
     source_name: String,
+    source: String,
 }
 
 impl SecurityVisitor<'_> {
@@ -42,6 +44,13 @@ impl SecurityVisitor<'_> {
             line: byte_offset,
             col: 0,
         }
+    }
+
+    fn source_snippet(&self, start: u32, end: u32) -> String {
+        let s = start as usize;
+        let e = (end as usize).min(self.source.len());
+        let raw = &self.source[s..e];
+        raw.chars().take(200).collect()
     }
 
     fn check_member_call(&mut self, prop: &str, args: &[Argument], loc: CodeLocation) {
@@ -179,7 +188,12 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                     if ident.name == "Function" && !new_expr.arguments.is_empty() {
                         let arg = last_string_arg(&new_expr.arguments);
                         if !is_benign_function_body(arg.as_deref()) {
-                            self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                            let snippet = if arg.is_none() {
+                                Some(self.source_snippet(call.span.start, call.span.end))
+                            } else {
+                                None
+                            };
+                            self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg, snippet });
                         }
                     }
                 }
@@ -202,7 +216,12 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                 "Function" if !new_expr.arguments.is_empty() => {
                     let arg = last_string_arg(&new_expr.arguments);
                     if !is_benign_function_body(arg.as_deref()) {
-                        self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg });
+                        let snippet = if arg.is_none() {
+                            Some(self.source_snippet(new_expr.span.start, new_expr.span.end))
+                        } else {
+                            None
+                        };
+                        self.report.add_js_flag(JsFlag::FunctionConstructor { loc, arg, snippet });
                     }
                 }
                 "XMLHttpRequest" => {

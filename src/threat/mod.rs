@@ -52,7 +52,7 @@ pub struct DecodedString {
 pub enum JsFlag {
     EvalCall(CodeLocation),
     EvalLiteralArg { value: String, loc: CodeLocation },
-    FunctionConstructor { loc: CodeLocation, arg: Option<String> },
+    FunctionConstructor { loc: CodeLocation, arg: Option<String>, snippet: Option<String> },
     DocumentWrite(CodeLocation),
     DangerousSink(DomMutation),
     NetworkCall(NetworkCall),
@@ -200,25 +200,27 @@ impl ThreatReport {
             JsFlag::EvalCall(_) => {
                 self.push_flag(Severity::Critical, "JS_EVAL_DETECTED", "eval() call".into());
             }
-            JsFlag::FunctionConstructor { arg, .. } => {
+            JsFlag::FunctionConstructor { arg, snippet, .. } => {
                 match arg {
                     Some(body) => {
                         // Literal body — analyst has the evidence to assess intent.
-                        let snippet = &body[..body.len().min(120)];
+                        let s = &body[..body.len().min(120)];
                         self.push_flag(
                             Severity::High,
                             "JS_FUNCTION_CONSTRUCTOR",
-                            format!("new Function({:?})", snippet),
+                            format!("new Function({:?})", s),
                         );
                     }
                     None => {
-                        // Dynamic/non-literal body — we cannot see what will be executed.
-                        // Flag at MEDIUM; CRITICAL requires corroborating obfuscation signals
-                        // (e.g. BASE64_OBFUSCATION) which the scorer can collapse.
+                        // Dynamic/non-literal body — show the raw source snippet so the
+                        // analyst can see the variable name and call site.
+                        let detail = snippet.as_deref()
+                            .unwrap_or("new Function(<dynamic expression>)")
+                            .to_string();
                         self.push_flag(
                             Severity::Medium,
                             "JS_FUNCTION_CONSTRUCTOR_DYNAMIC",
-                            "new Function(<dynamic expression>)".into(),
+                            detail,
                         );
                     }
                 }
