@@ -298,16 +298,24 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
             }
 
             // Capture z-index — used both for filtering and evidence quality.
-            // ClickFix/SocGholish overlays use z-index in the 1000s–100000s range
-            // to guarantee they sit above all page content. Navigation headers,
-            // hero sections, and site-builder overlays typically use z-index < 1000.
-            // Require z-index >= 1000 to fire, or fire on overlays with no z-index.
+            // Real ClickFix/SocGholish overlays use extreme z-index values
+            // (typically 99999–2147483647) to guarantee they sit above every page
+            // element. A value < 9999 means the overlay would be covered by other
+            // stacking-context elements, making it useless as a social-engineering
+            // prompt. Legitimate CSS frameworks use much lower values:
+            //   Bootstrap 4 modal backdrop = 1040; Bootstrap dialog = 1050.
+            //   Most cookie banners and plugins stay below 5000.
+            // Raising the threshold to 9999 eliminates Bootstrap and all common
+            // plugin z-indices while retaining every real attack pattern seen in
+            // ClickFix and SocGholish campaigns.
+            // Fire on overlays with no z-index (attacker omitted it — unusual but
+            // possible when no competing stacking contexts exist on the page).
             let z_index = z_re
                 .captures(&lower)
                 .and_then(|c| c.get(1))
                 .and_then(|m| m.as_str().parse::<u32>().ok());
             if let Some(z) = z_index {
-                if z < 1000 {
+                if z < 9999 {
                     continue;
                 }
             }
