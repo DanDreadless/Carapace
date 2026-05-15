@@ -101,6 +101,10 @@ pub struct ThreatReport {
     /// Full technology stack detected by the browser-grade DOM analyser.
     pub tech_stack: Vec<TechDetection>,
     pub risk_score: u8,
+    /// Set to true when the full render pipeline was skipped (LJS-05: non-HTML
+    /// content-type detected — JS analyser ran directly on the raw body).
+    #[serde(default)]
+    pub render_skipped: bool,
 
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
@@ -117,11 +121,24 @@ impl ThreatReport {
             framework_detected: None,
             tech_stack: Vec::new(),
             risk_score: 0,
+            render_skipped: false,
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),
             flags: Vec::new(),
         }
+    }
+
+    /// Merge flags from `other` into `self`, deduplicating by flag code.
+    /// Used by the overlapping-chunk analysis in the `/analyse` endpoint (LJS-08)
+    /// to combine findings from multiple chunk reports into one.
+    pub fn merge_flags(&mut self, other: ThreatReport) {
+        for flag in other.flags {
+            if !self.flags.iter().any(|f| f.code == flag.code) {
+                self.flags.push(flag);
+            }
+        }
+        self.recalculate_score();
     }
 
     pub fn set_framework(&mut self, framework: &Framework) {
@@ -257,14 +274,17 @@ impl ThreatReport {
             }
             JsFlag::SandboxEvasion { technique, detail, .. } => {
                 let (severity, code) = match technique.as_str() {
-                    "webdriver_check"          => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
-                    "headless_string_probe"    => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
-                    "screen_dimension_probe"   => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
-                    "plugins_probe"            => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
-                    "chrome_runtime_probe"     => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
-                    "focus_probe"              => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
-                    "canvas_fingerprint_probe" => (Severity::High,   "SANDBOX_EVASION_CANVAS_FINGERPRINT"),
-                    _                          => (Severity::Medium,  "SANDBOX_EVASION"),
+                    "webdriver_check"            => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
+                    "headless_string_probe"      => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
+                    "screen_dimension_probe"     => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
+                    "plugins_probe"              => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
+                    "chrome_runtime_probe"       => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
+                    "focus_probe"                => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
+                    "canvas_fingerprint_probe"   => (Severity::High,   "SANDBOX_EVASION_CANVAS_FINGERPRINT"),
+                    "languages_probe"            => (Severity::Medium, "SANDBOX_EVASION_LANGUAGES"),
+                    "notification_probe"         => (Severity::High,   "SANDBOX_EVASION_NOTIFICATION"),
+                    "hardware_fingerprint_probe" => (Severity::High,   "SANDBOX_EVASION_HARDWARE_FINGERPRINT"),
+                    _                            => (Severity::Medium,  "SANDBOX_EVASION"),
                 };
                 self.push_flag(severity, code, detail.clone());
             }
@@ -362,6 +382,27 @@ impl ThreatReport {
         self.recalculate_score();
     }
 
+    /// Returns `true` when a flag with the given code has already been recorded.
+    /// Used by post-render checks to correlate with earlier static-analysis findings.
+    pub fn has_flag_code(&self, code: &str) -> bool {
+        self.flags.iter().any(|f| f.code == code)
+    }
+
+    /// Record a JavaScript-injected viewport-spanning overlay — the runtime delivery
+    /// mechanism for ClickFix, SocGholish, and ClearFake.
+    ///
+    /// `has_clipboard_write`: when true the ClickFix chain is complete (overlay + clipboard
+    /// pre-loaded with a shell command) and severity is escalated to CRITICAL.
+    pub fn add_dynamic_overlay_injected(&mut self, evidence: &str, has_clipboard_write: bool) {
+        let (severity, code) = if has_clipboard_write {
+            (Severity::Critical, "DYNAMIC_OVERLAY_INJECTED_CLICKFIX")
+        } else {
+            (Severity::High, "DYNAMIC_OVERLAY_INJECTED")
+        };
+        self.push_flag(severity, code, evidence.to_string());
+        self.recalculate_score();
+    }
+
     pub fn html_flags(&self) -> &[HtmlFlag] {
         &self.html_flags
     }
@@ -416,14 +457,17 @@ impl ThreatReport {
                 JsFlag::CookieWrite(_) => "COOKIE_ACCESS",
                 JsFlag::TimerWithString { .. } => "TIMER_STRING_EXEC",
                 JsFlag::SandboxEvasion { technique, .. } => match technique.as_str() {
-                    "webdriver_check"          => "SANDBOX_EVASION_WEBDRIVER",
-                    "headless_string_probe"    => "SANDBOX_EVASION_HEADLESS_STRING",
-                    "screen_dimension_probe"   => "SANDBOX_EVASION_SCREEN_PROBE",
-                    "plugins_probe"            => "SANDBOX_EVASION_PLUGINS_PROBE",
-                    "chrome_runtime_probe"     => "SANDBOX_EVASION_CHROME_RUNTIME",
-                    "focus_probe"              => "SANDBOX_EVASION_FOCUS_PROBE",
-                    "canvas_fingerprint_probe" => "SANDBOX_EVASION_CANVAS_FINGERPRINT",
-                    _                          => "SANDBOX_EVASION",
+                    "webdriver_check"            => "SANDBOX_EVASION_WEBDRIVER",
+                    "headless_string_probe"      => "SANDBOX_EVASION_HEADLESS_STRING",
+                    "screen_dimension_probe"     => "SANDBOX_EVASION_SCREEN_PROBE",
+                    "plugins_probe"              => "SANDBOX_EVASION_PLUGINS_PROBE",
+                    "chrome_runtime_probe"       => "SANDBOX_EVASION_CHROME_RUNTIME",
+                    "focus_probe"                => "SANDBOX_EVASION_FOCUS_PROBE",
+                    "canvas_fingerprint_probe"   => "SANDBOX_EVASION_CANVAS_FINGERPRINT",
+                    "languages_probe"            => "SANDBOX_EVASION_LANGUAGES",
+                    "notification_probe"         => "SANDBOX_EVASION_NOTIFICATION",
+                    "hardware_fingerprint_probe" => "SANDBOX_EVASION_HARDWARE_FINGERPRINT",
+                    _                            => "SANDBOX_EVASION",
                 },
                 JsFlag::ClipboardWrite { .. } => continue,
                 _ => continue,

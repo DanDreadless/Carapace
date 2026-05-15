@@ -302,6 +302,155 @@ fn draw_text_line(
     }
 }
 
+// ── Screenshot annotation (CARAPACE-08) ──────────────────────────────────────
+
+const BADGE_H: u32 = 52;
+/// Near-black at 90% opacity — sits over any page background colour.
+const BADGE_BG: [u8; 4] = [12, 17, 23, 230];
+
+fn risk_badge(risk: u8) -> ([u8; 4], &'static str) {
+    if      risk >= 40 { ([239,  68,  68, 255], "MALICIOUS")  }
+    else if risk >= 20 { ([249, 115,  22, 255], "SUSPICIOUS") }
+    else if risk >=  1 { ([234, 179,   8, 255], "ELEVATED")   }
+    else               { ([ 34, 197,  94, 255], "CLEAN")      }
+}
+
+fn truncate_text(font: &FontArc, scale: PxScale, text: &str, max_width: f32) -> String {
+    let ellipsis_w = measure_text(font, scale, "...");
+    let mut width = 0.0_f32;
+    let scaled = font.as_scaled(scale);
+    let mut prev: Option<ab_glyph::GlyphId> = None;
+    let mut last_fit = text.len();
+    for (i, c) in text.char_indices() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev { width += scaled.kern(p, gid); }
+        width += scaled.h_advance(gid);
+        if width > max_width - ellipsis_w { last_fit = i; break; }
+        prev = Some(gid);
+    }
+    if last_fit == text.len() { text.to_string() } else { format!("{}...", &text[..last_fit]) }
+}
+
+/// Fill a rectangle on an `RgbaImage` with alpha blending.
+fn fill_rgba(img: &mut image::RgbaImage, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+    let (iw, ih) = img.dimensions();
+    let fa = color[3] as f32 / 255.0;
+    for py in y..(y + h).min(ih) {
+        for px in x..(x + w).min(iw) {
+            let [er, eg, eb, ea] = img.get_pixel(px, py).0;
+            let ea_f = ea as f32 / 255.0;
+            let out_a = (fa + ea_f * (1.0 - fa)).max(0.001);
+            let blend = |fg: u8, bg: u8| ((fg as f32 * fa + bg as f32 * ea_f * (1.0 - fa)) / out_a) as u8;
+            img.put_pixel(px, py, image::Rgba([blend(color[0], er), blend(color[1], eg), blend(color[2], eb), (out_a * 255.0) as u8]));
+        }
+    }
+}
+
+/// Render a text run onto an `RgbaImage` using `ab_glyph`.
+fn draw_text_rgba(img: &mut image::RgbaImage, font: &FontArc, text: &str, mut x: f32, y: f32, scale: PxScale, color: [u8; 4]) {
+    let scaled = font.as_scaled(scale);
+    let mut prev: Option<ab_glyph::GlyphId> = None;
+    let (iw, ih) = img.dimensions();
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev { x += scaled.kern(p, gid); }
+        let advance = scaled.h_advance(gid);
+        if let Some(outlined) = font.outline_glyph(gid.with_scale_and_position(scale, ab_glyph::point(x, y))) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|rx, ry, coverage| {
+                if coverage < 0.01 { return; }
+                let px = bounds.min.x as i32 + rx as i32;
+                let py = bounds.min.y as i32 + ry as i32;
+                if px < 0 || py < 0 || px >= iw as i32 || py >= ih as i32 { return; }
+                let alpha = (coverage * color[3] as f32) as u8;
+                let fa = alpha as f32 / 255.0;
+                let [er, eg, eb, ea] = img.get_pixel(px as u32, py as u32).0;
+                let ea_f = ea as f32 / 255.0;
+                let out_a = (fa + ea_f * (1.0 - fa)).max(0.001);
+                let blend = |fg: u8, bg: u8| ((fg as f32 * fa + bg as f32 * ea_f * (1.0 - fa)) / out_a) as u8;
+                img.put_pixel(px as u32, py as u32, image::Rgba([blend(color[0], er), blend(color[1], eg), blend(color[2], eb), (out_a * 255.0) as u8]));
+            });
+        }
+        x += advance;
+        prev = Some(gid);
+    }
+}
+
+/// Composite a risk annotation badge onto the bottom of a PNG screenshot in place.
+///
+/// Badge layout (36 px strip, full width):
+///   `[VERDICT]  domain.com                      Risk: N  ·  YYYY-MM-DD HH:MM UTC`
+///
+/// Colours are keyed to Carapace risk score (≥40 MALICIOUS red, ≥20 SUSPICIOUS orange,
+/// ≥1 ELEVATED amber, 0 CLEAN green).  No-ops on any load/save failure.
+pub fn annotate_screenshot(path: &Path, risk_score: u8, domain: &str, scan_time: &str) {
+    use image::GenericImage as _;
+
+    let mut img = match image::open(path) {
+        Ok(i)  => i.to_rgba8(),
+        Err(e) => { warn!("annotate_screenshot: open {:?}: {}", path, e); return; }
+    };
+
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 { return; }
+
+    let (font, bold) = load_fonts();
+    let regular = font.as_ref().or(bold.as_ref());
+    let bfont   = bold.as_ref().or(font.as_ref());
+
+    let badge_y    = h.saturating_sub(BADGE_H);
+    let font_sz    = PxScale::from(15.0);
+    let center_y   = badge_y as f32 + BADGE_H as f32 / 2.0 + 5.0;  // text baseline
+
+    // ── Background strip ──────────────────────────────────────────────────────
+    fill_rgba(&mut img, 0, badge_y, w, BADGE_H, BADGE_BG);
+
+    // ── Verdict pill ──────────────────────────────────────────────────────────
+    let (pill_color, label) = risk_badge(risk_score);
+    let pill_pad = 8.0_f32;
+    let label_w  = bfont.map(|f| measure_text(f, font_sz, label)).unwrap_or(65.0);
+    let pill_w   = (label_w + pill_pad * 2.0) as u32;
+    let pill_h   = 32u32;
+    let pill_x   = 12u32;
+    let pill_y   = badge_y + (BADGE_H - pill_h) / 2;
+
+    fill_rgba(&mut img, pill_x, pill_y, pill_w, pill_h, pill_color);
+
+    if let Some(f) = bfont {
+        let ty = pill_y as f32 + pill_h as f32 / 2.0 + 5.0;
+        draw_text_rgba(&mut img, f, label, pill_x as f32 + pill_pad, ty, font_sz, [255, 255, 255, 255]);
+    }
+
+    // ── Domain ────────────────────────────────────────────────────────────────
+    let domain_x = pill_x as f32 + pill_w as f32 + 12.0;
+    // Right-side reserve is proportional to width so text doesn't cramp on 375px mobile captures.
+    let right_reserve = (w as f32 * 0.38).min(220.0).max(80.0);
+    if let Some(f) = regular {
+        let max_domain_w = (w as f32 - domain_x - right_reserve).max(40.0);
+        let truncated = truncate_text(f, font_sz, domain, max_domain_w);
+        draw_text_rgba(&mut img, f, &truncated, domain_x, center_y, font_sz, [210, 210, 210, 255]);
+    }
+
+    // ── Right-aligned: "Risk: N  ·  timestamp" ───────────────────────────────
+    // On narrow captures (mobile, <500 px) omit the timestamp to avoid overflow.
+    let right_text = if w >= 500 {
+        format!("Risk: {}  ·  {}", risk_score, scan_time)
+    } else {
+        format!("Risk: {}", risk_score)
+    };
+    let right_pad  = 12.0_f32;
+    if let Some(f) = regular {
+        let right_w = measure_text(f, font_sz, &right_text);
+        let rx = w as f32 - right_pad - right_w;
+        let [rc, gc, bc, _] = pill_color;
+        draw_text_rgba(&mut img, f, &right_text, rx, center_y, font_sz, [rc, gc, bc, 220]);
+    }
+
+    if let Err(e) = img.save(path) {
+        warn!("annotate_screenshot: save {:?}: {}", path, e);
+    }
+}
+
 // ── Geometry helpers ──────────────────────────────────────────────────────────
 
 fn clip_rect(r: &crate::layout::LayoutRect, pw: u32, ph: u32) -> Option<SkRect> {

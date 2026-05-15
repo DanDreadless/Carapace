@@ -1,8 +1,9 @@
 /// HTTP API server for Carapace.
 ///
-/// Exposes two endpoints:
-///   POST /render  — fetch a URL, render it, return image + threat report
-///   GET  /health  — liveness probe
+/// Exposes three endpoints:
+///   POST /render   — fetch a URL, render it with Chromium, return image + threat report
+///   POST /analyse  — run OXC static JS analysis on a URL or raw content (no Chromium)
+///   GET  /health   — liveness probe
 ///
 /// Authentication is optional: set `--api-key` (or `CARAPACE_API_KEY` env var)
 /// to require an `X-API-Key` header on every request.
@@ -52,10 +53,13 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/render", post(handlers::render))
         .route("/health", get(handlers::health))
+        .route("/analyse", post(handlers::analyse))
         .with_state(state)
-        // Reject request bodies over 1 MB to prevent memory exhaustion.
-        // The actual URL payload is tiny; this guards against malformed clients.
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024));
+        // Body limit: /render and /health only need tiny payloads (a URL string).
+        // /analyse accepts raw JS content up to 2 MB + JSON envelope overhead, so
+        // the global limit is raised to 4 MB.  Per-route limits are not used to
+        // keep the router configuration simple.
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024));
 
     let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr)

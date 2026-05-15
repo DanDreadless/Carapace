@@ -332,6 +332,35 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                         loc,
                     });
                 }
+                // navigator.languages — returns an empty array in headless Chromium.
+                // Fingerprinting scripts check .length === 0 to detect automated environments.
+                ("navigator", "languages") => {
+                    self.report.add_js_flag(JsFlag::SandboxEvasion {
+                        technique: "languages_probe".into(),
+                        detail: "navigator.languages accessed — returns empty array in headless; used to fingerprint automated analysis environments".into(),
+                        loc,
+                    });
+                }
+                // Notification.permission — headless browsers lack a real Notification API;
+                // the returned value differs from real user browsers, making this a reliable
+                // fingerprinting signal with no legitimate production use.
+                ("Notification", "permission") => {
+                    self.report.add_js_flag(JsFlag::SandboxEvasion {
+                        technique: "notification_probe".into(),
+                        detail: "Notification.permission accessed — headless browsers return a default state that differs from real user browsers; used to detect automated analysis environments".into(),
+                        loc,
+                    });
+                }
+                // navigator.deviceMemory / navigator.hardwareConcurrency — both undefined
+                // in headless Chromium. Used together or individually to build a hardware
+                // profile and fingerprint the client as an automated analysis environment.
+                ("navigator", "deviceMemory" | "hardwareConcurrency") => {
+                    self.report.add_js_flag(JsFlag::SandboxEvasion {
+                        technique: "hardware_fingerprint_probe".into(),
+                        detail: format!("navigator.{prop} accessed — undefined in headless Chromium; hardware fingerprinting probe used to detect automated analysis environments"),
+                        loc,
+                    });
+                }
                 _ => {}
             }
         }
@@ -563,6 +592,38 @@ mod tests {
         let report = run("if (navigator.plugins.length === 0) { redirect(); }");
         assert!(report.js_flags().iter().any(|f| matches!(
             f, JsFlag::SandboxEvasion { technique, .. } if technique == "plugins_probe"
+        )));
+    }
+
+    #[test]
+    fn detects_navigator_languages_probe() {
+        let report = run("if (navigator.languages.length === 0) { redirect(); }");
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::SandboxEvasion { technique, .. } if technique == "languages_probe"
+        )));
+    }
+
+    #[test]
+    fn detects_notification_permission_probe() {
+        let report = run(r#"if (Notification.permission === "default") { serveClean(); }"#);
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::SandboxEvasion { technique, .. } if technique == "notification_probe"
+        )));
+    }
+
+    #[test]
+    fn detects_hardware_fingerprint_probe_device_memory() {
+        let report = run("if (!navigator.deviceMemory) { redirect(); }");
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::SandboxEvasion { technique, .. } if technique == "hardware_fingerprint_probe"
+        )));
+    }
+
+    #[test]
+    fn detects_hardware_fingerprint_probe_hardware_concurrency() {
+        let report = run("var cores = navigator.hardwareConcurrency; if (!cores) { redirect(); }");
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::SandboxEvasion { technique, .. } if technique == "hardware_fingerprint_probe"
         )));
     }
 

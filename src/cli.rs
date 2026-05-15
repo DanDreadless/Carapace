@@ -67,6 +67,12 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = 800)]
     pub height: u32,
 
+    /// Capture a second screenshot at mobile viewport (375×812) alongside the desktop render.
+    /// Many phishing pages and ClickFix campaigns are mobile-first; the desktop render can
+    /// hide key attack UI that only appears at narrow widths.
+    #[arg(long, default_value_t = false)]
+    pub mobile_screenshot: bool,
+
     /// Write threat report JSON alongside output (default: true)
     #[arg(long, default_value_t = true)]
     pub threat_report: bool,

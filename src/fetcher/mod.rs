@@ -68,6 +68,11 @@ impl SafeFetcher {
             // vice-versa.
             .tls_built_in_root_certs(true)
             .tls_built_in_native_certs(true)
+            // Accept TLS certificate errors (hostname mismatch, expired, self-signed).
+            // Matches the Python scanner's verify=False behaviour: the SSL analyser
+            // already reports cert errors as findings, so we still want Carapace to
+            // render the page content for threat analysis even when TLS is broken.
+            .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(options.timeout_secs))
             .connect_timeout(Duration::from_secs(10))

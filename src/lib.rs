@@ -43,6 +43,34 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
     // Check for drive-by download on the primary URL.
     check_drive_by_download(&fetch_result, &mut report);
 
+    // ── LJS-05: Content-type gate ─────────────────────────────────────────────
+    // If the fetched resource is not an HTML document, skip the full render
+    // pipeline.  Feeding raw JS/CSS/JSON to Chromium executes it in a blank-page
+    // context where async code never resolves — causing the process to hang.
+    // Instead, run the OXC-based static JS analyser directly on the raw body and
+    // return immediately.  `render_skipped: true` signals to the caller that no
+    // screenshot was produced.
+    if !fetch_result.content_type.contains("text/html") {
+        info!(
+            "non-HTML content-type {:?} — skipping render, running JS static analysis only",
+            fetch_result.content_type,
+        );
+        if let Ok(source) = std::str::from_utf8(&fetch_result.body) {
+            crate::js::analysis::analyse(source, base_url.as_str(), &mut report);
+        }
+        report.render_skipped = true;
+        if args.threat_report {
+            let report_path = args.output.with_extension("threat.json");
+            let json = report.to_json()?;
+            std::fs::write(&report_path, &json)?;
+        }
+        if args.output_format == OutputFormat::Json {
+            let json = report.to_json()?;
+            std::fs::write(&args.output, &json)?;
+        }
+        return Ok(report);
+    }
+
     // ── 2. Parse + sanitise HTML ───────────────────────────────────────────────
     info!("parsing HTML ({} bytes)", fetch_result.body.len());
     let html_processor = HtmlProcessor::new(base_url.clone());
@@ -106,6 +134,19 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
             // Primary: headless browser (exact, JS enabled)
             browser_render(args, &page, &base_url, &css_sheets, &image_bytes, &mut report)?;
         }
+
+        // CARAPACE-08: annotate screenshot(s) with risk badge.
+        // Called after render so risk_score reflects all findings including DOM dump.
+        let domain    = base_url.host_str().unwrap_or("unknown");
+        let scan_time = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+        if args.output.exists() {
+            crate::renderer::annotate_screenshot(&args.output, report.risk_score, domain, &scan_time);
+        }
+        // Annotate mobile screenshot if it was produced.
+        let mobile_path = args.output.with_extension("mobile.png");
+        if mobile_path.exists() {
+            crate::renderer::annotate_screenshot(&mobile_path, report.risk_score, domain, &scan_time);
+        }
     }
 
     // ── 6. Write threat report ────────────────────────────────────────────────
@@ -154,16 +195,35 @@ fn browser_render(
 
     info!("self-contained HTML written to {} ({} bytes)", tmp_path.display(), self_contained_html.len());
 
-    let result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height);
+    // Pass 1: desktop screenshot.
+    let screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height);
 
-    // Always clean up the temp file.
+    // Pass 2: post-JS DOM dump (CARAPACE-02 — dynamic overlay detection).
+    // Only run when the screenshot succeeded: confirms Chromium is available and
+    // the page rendered.  The temp file must stay alive until all passes complete.
+    let dumped_dom = if screenshot_result.is_ok() {
+        backend::dump_dom(&tmp_path)
+    } else {
+        String::new()
+    };
+
+    // Pass 3: mobile viewport screenshot (CARAPACE-05).
+    // Fixed at 375×844 (iPhone viewport ratio) — full-page mode produced
+    // excessively tall captures on overlay-heavy phishing pages.
+    // Non-fatal: a mobile render failure does not affect the desktop result.
+    if args.mobile_screenshot && screenshot_result.is_ok() {
+        let mobile_path = args.output.with_extension("mobile.png");
+        let _ = backend::render_to_png(&tmp_path, &mobile_path, 375, 844);
+    }
+
+    // Clean up temp file after all passes.
     let _ = std::fs::remove_file(&tmp_path);
 
     // Surface any URLs that JavaScript attempted to fetch at runtime.
     // Filter out same-site requests (own domain / subdomains) — these are
     // normal WordPress REST API calls, lazy-load fetches, etc. and are not
     // evidence of C2 communication or payload retrieval.
-    if let Ok(ref intercepted) = result {
+    if let Ok(ref intercepted) = screenshot_result {
         let external: Vec<String> = intercepted
             .iter()
             .filter(|u| !is_same_site(&base_url, u))
@@ -174,7 +234,12 @@ fn browser_render(
         }
     }
 
-    result.map(|_| ())
+    // Analyse the post-JS DOM for viewport-spanning overlays injected at runtime.
+    if !dumped_dom.is_empty() {
+        check_dynamic_overlay_injected(&self_contained_html, &dumped_dom, report);
+    }
+
+    screenshot_result.map(|_| ())
 }
 
 // ── CSS overlay threat analysis ───────────────────────────────────────────────
@@ -220,7 +285,7 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
     });
 
     static Z_RE: OnceLock<Regex> = OnceLock::new();
-    let z_re = Z_RE.get_or_init(|| Regex::new(r"z-index\s*:\s*(\d+)").unwrap());
+    let z_re = Z_RE.get_or_init(|| Regex::new(r"z-index\s*:\s*(-?\d+)").unwrap());
 
     static OPACITY_RE: OnceLock<Regex> = OnceLock::new();
     let opacity_re = OPACITY_RE.get_or_init(|| Regex::new(r"opacity\s*:\s*0?\.[0-9]").unwrap());
@@ -313,8 +378,15 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
             let z_index = z_re
                 .captures(&lower)
                 .and_then(|c| c.get(1))
-                .and_then(|m| m.as_str().parse::<u32>().ok());
+                .and_then(|m| m.as_str().parse::<i32>().ok());
             if let Some(z) = z_index {
+                if z < 0 {
+                    // Negative z-index: element is stacked behind page content and
+                    // cannot obscure anything.  GitHub uses z-index:-1 on ::before
+                    // pseudo-element backdrops for modal dialogs — these are CSS
+                    // decoration, not attack overlays.
+                    continue;
+                }
                 if z < 9999 {
                     continue;
                 }
@@ -346,8 +418,34 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 && !lower.contains("background:none")
                 && !lower.contains("background: none")
                 && !lower.contains("background:transparent")
-                && !lower.contains("background: transparent");
+                && !lower.contains("background: transparent")
+                // Also suppress background-color:transparent (longhand form).
+                // AWS WAF challenge.js uses background-color:transparent on its
+                // overlay container — the visible content is in child elements.
+                && !lower.contains("background-color:transparent")
+                && !lower.contains("background-color: transparent");
             if !has_background {
+                continue;
+            }
+
+            // Suppress overlays whose background is set exclusively via a CSS custom
+            // property (var(--...)).  Real ClickFix / SocGholish overlays always use
+            // concrete colour values — they must control the exact visual appearance
+            // to be convincing as fake CAPTCHA or browser-update dialogs.  CSS variable
+            // backgrounds belong to SPA loading screens and CMS design-token themes.
+            let has_only_css_var_bg = {
+                let has_var = lower.contains("background:var(--") || lower.contains("background: var(--")
+                    || lower.contains("background-color:var(--") || lower.contains("background-color: var(--");
+                let has_concrete = lower.contains("background:#") || lower.contains("background: #")
+                    || lower.contains("background:rgb") || lower.contains("background: rgb")
+                    || lower.contains("background:hsl") || lower.contains("background: hsl")
+                    || lower.contains("background:black") || lower.contains("background: black")
+                    || lower.contains("background:white") || lower.contains("background: white")
+                    || lower.contains("background-color:#") || lower.contains("background-color: #")
+                    || lower.contains("background-color:rgb") || lower.contains("background-color: rgb");
+                has_var && !has_concrete
+            };
+            if has_only_css_var_bg {
                 continue;
             }
 
@@ -368,6 +466,215 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
             report.add_css_overlay(&detail);
             return; // one finding per page is sufficient
         }
+    }
+}
+
+// ── Dynamic overlay detection (CARAPACE-02) ───────────────────────────────────
+
+/// Detect ClickFix / SocGholish / ClearFake overlays injected by JavaScript at runtime.
+///
+/// Strategy:
+///   1. Scan the post-JS DOM dump for block-level elements with inline
+///      `position:fixed` styles that span the full viewport (width+height 100%/vw/vh).
+///   2. Apply the same guard conditions as `check_css_overlay_threat`:
+///      high z-index, visible background, not hidden, not pointer-events:none,
+///      not off-screen, no semi-transparent rgba backdrop.
+///   3. Check whether the element is present in the original static HTML via
+///      three fingerprints (id attribute → primary class → style prefix).
+///      Elements that pass all overlay guards AND are absent from the static
+///      source were injected by JavaScript — the defining mark of ClickFix,
+///      SocGholish, and ClearFake.
+///   4. Escalate to CRITICAL when a clipboard write was also detected (the
+///      complete ClickFix attack chain: fake prompt + pre-loaded shell command).
+fn check_dynamic_overlay_injected(
+    static_html: &str,
+    dumped_dom:  &str,
+    report:      &mut ThreatReport,
+) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Match any block-level opening tag that carries an inline style attribute.
+    // Groups: 1 = tag name, 2 = attrs area (between tag name and >), 3 = style value.
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)<([a-zA-Z][a-zA-Z0-9]*)([^>]*\bstyle\s*=\s*"([^"]{15,})"[^>]*)>"#
+        ).unwrap()
+    });
+
+    static ID_RE: OnceLock<Regex> = OnceLock::new();
+    let id_re = ID_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bid\s*=\s*"([^"]{1,80})""#).unwrap()
+    });
+
+    static CLASS_RE: OnceLock<Regex> = OnceLock::new();
+    let class_re = CLASS_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bclass\s*=\s*"([^"]{1,200})""#).unwrap()
+    });
+
+    static Z_RE: OnceLock<Regex> = OnceLock::new();
+    let z_re = Z_RE.get_or_init(|| Regex::new(r"z-index\s*:\s*(-?\d+)").unwrap());
+
+    static RGBA_ALPHA_RE: OnceLock<Regex> = OnceLock::new();
+    let rgba_alpha_re = RGBA_ALPHA_RE.get_or_init(|| {
+        Regex::new(r"rgba\s*\([^)]*,\s*0?\.[0-9]").unwrap()
+    });
+
+    static OPACITY_RE: OnceLock<Regex> = OnceLock::new();
+    let opacity_re = OPACITY_RE.get_or_init(|| {
+        Regex::new(r"opacity\s*:\s*0?\.[0-9]").unwrap()
+    });
+
+    // Inline-only HTML elements that cannot realistically be fullscreen overlays.
+    const INLINE_TAGS: &[&str] = &[
+        "span", "a", "img", "input", "button", "label", "em", "strong",
+        "i", "b", "small", "sup", "sub", "code", "abbr", "time", "select",
+    ];
+
+    let static_lower = static_html.to_ascii_lowercase();
+
+    for cap in tag_re.captures_iter(dumped_dom) {
+        let tag    = cap[1].to_ascii_lowercase();
+        let attrs  = &cap[2]; // everything between tag name and closing >
+        let style  = &cap[3];
+        let full_tag = &cap[0]; // the complete <tag ... > string
+
+        // Skip inline elements.
+        if INLINE_TAGS.iter().any(|&t| t == tag.as_str()) {
+            continue;
+        }
+
+        // Normalise style for gate checks.
+        let compact: String = style
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|&c| c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            .collect();
+
+        // Must be position:fixed (position:absolute has too many legitimate uses).
+        if !compact.contains("position:fixed") {
+            continue;
+        }
+
+        // Must span full viewport width.
+        if !compact.contains("width:100%") && !compact.contains("width:100vw") {
+            continue;
+        }
+
+        // Must span full viewport height.
+        if !compact.contains("height:100%") && !compact.contains("height:100vh") {
+            continue;
+        }
+
+        // Suppress hidden elements — not currently visible to the visitor.
+        if compact.contains("display:none") || compact.contains("visibility:hidden") {
+            continue;
+        }
+
+        // Suppress pointer-events:none — cannot capture user interaction.
+        if compact.contains("pointer-events:none") {
+            continue;
+        }
+
+        // Suppress off-screen elements (slide-in drawers, off-canvas menus).
+        if compact.contains("left:-")
+            || compact.contains("top:-")
+            || compact.contains("translatex(-100%")
+            || compact.contains("translate3d(-100%")
+        {
+            continue;
+        }
+
+        // z-index must be extreme (≥9999) or absent.  Below 9999 the overlay
+        // would be covered by other stacking contexts (modals, Bootstrap, etc.).
+        let z_index = z_re
+            .captures(&compact)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<i32>().ok());
+        if let Some(z) = z_index {
+            if z < 0 || z < 9999 {
+                continue;
+            }
+        }
+
+        // Suppress semi-transparent backdrops — rgba() with fractional alpha or
+        // opacity < 1 means the overlay dims rather than hides the page, which
+        // is a modal/lightbox pattern, not an attack overlay.
+        if rgba_alpha_re.is_match(style) || opacity_re.is_match(style) {
+            continue;
+        }
+
+        // Must have an explicit opaque background — ClickFix/SocGholish overlays
+        // always define one.  Transparent fixed layers cannot obscure page content.
+        let has_bg = compact.contains("background")
+            && !compact.contains("background:none")
+            && !compact.contains("background:transparent")
+            && !compact.contains("background-color:transparent");
+        if !has_bg {
+            continue;
+        }
+
+        // ── DOM diff: verify this element was NOT in the original static HTML ──
+        //
+        // ClickFix / SocGholish / ClearFake inject NEW elements via createElement.
+        // Legitimate overlays (GDPR banners, modals, cookie notices) exist in the
+        // static source and are merely made visible by JavaScript.
+        //
+        // Three fingerprints checked in order of reliability:
+        //   (1) id attribute — most unique; strong discriminator
+        //   (2) Primary CSS class — useful when no id is set
+        //   (3) First 50 compact chars of the style value — catches purely
+        //       inline-styled injections that carry neither id nor class
+        let mut found_in_original = false;
+
+        // (1) id fingerprint
+        if let Some(id_cap) = id_re.captures(attrs) {
+            let id_val = id_cap[1].to_ascii_lowercase();
+            if !id_val.is_empty()
+                && (static_lower.contains(&format!(r#"id="{id_val}""#))
+                    || static_lower.contains(&format!(r#"id='{id_val}'"#)))
+            {
+                found_in_original = true;
+            }
+        }
+
+        // (2) primary-class fingerprint
+        if !found_in_original {
+            if let Some(cls_cap) = class_re.captures(attrs) {
+                let classes_lower = cls_cap[1].to_ascii_lowercase();
+                if let Some(first) = classes_lower.split_whitespace().next() {
+                    // Require the class name to be at least 4 chars — single-char
+                    // or very short utility classes (Bootstrap "d", "w", etc.) are
+                    // too common to be a reliable fingerprint.
+                    if first.len() >= 4
+                        && static_lower.contains(&format!("class=\"{first}"))
+                    {
+                        found_in_original = true;
+                    }
+                }
+            }
+        }
+
+        // (3) style prefix fingerprint
+        if !found_in_original {
+            let style_fp: String = compact.chars().take(50).collect();
+            if style_fp.len() >= 20 && static_lower.contains(&style_fp) {
+                found_in_original = true;
+            }
+        }
+
+        if found_in_original {
+            continue;
+        }
+
+        // All gates passed and the element is absent from the original static HTML —
+        // it was injected by JavaScript at runtime.
+        let evidence: String = full_tag.chars().take(400).collect();
+        let has_clipboard = report.has_flag_code("CLIPBOARD_HIJACK")
+            || report.has_flag_code("CLIPBOARD_HIJACK_CLICKFIX");
+        report.add_dynamic_overlay_injected(&evidence, has_clipboard);
+        return; // one finding per page
     }
 }
 
