@@ -270,3 +270,9 @@ Detection covers: React, Vue, Angular, Svelte, Next.js, Nuxt, HTMX, Alpine.js, L
 The primary render path is Chromium headless with JavaScript enabled and a logging network proxy. If Chromium is not available, Carapace falls back to `wkhtmltoimage` with JavaScript disabled.
 
 Pass `--no-browser` to force the built-in Rust renderer (tiny-skia + taffy layout engine). The Rust renderer is approximate — it handles basic CSS box model, flexbox, and inline text but does not support all CSS features. Use it only when no headless browser is available.
+
+---
+
+## License
+
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
