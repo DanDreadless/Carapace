@@ -73,6 +73,19 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = false)]
     pub mobile_screenshot: bool,
 
+    /// Use an iPhone/Safari User-Agent for the page fetch and Chromium render.
+    /// Enables detection of pages that cloak content by User-Agent — serving a
+    /// blank placeholder to desktop browsers while showing the real phishing
+    /// page to iPhone visitors.
+    #[arg(long, default_value_t = false)]
+    pub mobile_ua: bool,
+
+    /// Use an Android/Chrome User-Agent instead of iPhone.
+    /// Fallback for pages that target Android specifically or cloak from iOS.
+    /// Takes precedence over --mobile-ua when both are set.
+    #[arg(long, default_value_t = false)]
+    pub android_ua: bool,
+
     /// Write threat report JSON alongside output (default: true)
     #[arg(long, default_value_t = true)]
     pub threat_report: bool,
@@ -101,6 +114,13 @@ impl RenderArgs {
             max_redirects: self.max_redirects,
             timeout_secs: self.timeout,
             no_assets: self.no_assets,
+            user_agent: if self.android_ua {
+                Some(crate::renderer::backend::ANDROID_UA.to_string())
+            } else if self.mobile_ua {
+                Some(crate::renderer::backend::IPHONE_UA.to_string())
+            } else {
+                None
+            },
         }
     }
 }

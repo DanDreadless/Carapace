@@ -175,9 +175,19 @@ pub fn sanitize_css_for_browser(css: &str) -> String {
     ).unwrap();
     out = ext_url_re.replace_all(&out, "url(/* external blocked */)").into_owned();
 
-    // Remove @font-face blocks (they almost always point to remote font files)
+    // Remove @font-face blocks that still reference external URLs.
+    // Blocks whose src values have been pre-inlined as data: URIs by
+    // inline_css_url_refs() are kept — stripping them would discard the
+    // already-fetched font data and defeat the purpose of pre-fetching.
     let font_face_re = regex::Regex::new(r"(?is)@font-face\s*\{[^}]*\}").unwrap();
-    out = font_face_re.replace_all(&out, "/* @font-face blocked */").into_owned();
+    let ext_url_check = regex::Regex::new(r#"(?i)url\s*\(\s*['"]?\s*(?:https?://|//)"#).unwrap();
+    out = font_face_re.replace_all(&out, |caps: &regex::Captures| {
+        if ext_url_check.is_match(&caps[0]) {
+            "/* @font-face blocked */".to_string()
+        } else {
+            caps[0].to_string()
+        }
+    }).into_owned();
 
     out
 }

@@ -26,6 +26,9 @@ pub struct FetchOptions {
     pub max_redirects: u32,
     pub timeout_secs: u64,
     pub no_assets: bool,
+    /// Override the default Windows-Chrome User-Agent.
+    /// Used when the target is known to cloak content based on User-Agent.
+    pub user_agent: Option<String>,
 }
 
 impl Default for FetchOptions {
@@ -37,6 +40,7 @@ impl Default for FetchOptions {
             max_redirects: 5,
             timeout_secs: 30,
             no_assets: false,
+            user_agent: None,
         }
     }
 }
@@ -76,11 +80,15 @@ impl SafeFetcher {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(options.timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            // Mimic a real Windows Chrome browser so that servers performing
-            // User-Agent fingerprinting serve their real content (including
-            // conditional malicious payloads like ClickFix overlays) rather
-            // than a bot-safe clean page.
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+            // Mimic a real browser so that servers performing User-Agent
+            // fingerprinting serve their real content (including conditional
+            // malicious payloads) rather than a bot-safe clean page.
+            // The caller can override with a mobile UA to reach pages that
+            // cloak their content from non-iPhone browsers.
+            .user_agent(
+                options.user_agent.as_deref()
+                    .unwrap_or("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+            )
             .build()?;
 
         Ok(Self { client, options })

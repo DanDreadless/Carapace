@@ -85,11 +85,16 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
     let js_processor = JsProcessor::new(!args.no_js_sandbox);
     let _js_output = js_processor.process(&page, &mut report)?;
 
-    // ── 4. Fetch sub-resources (CSS + images) unless --no-assets ──────────────
+    // ── 4. Fetch sub-resources (CSS + images + JS) unless --no-assets ──────────
     // We always collect the raw fetched CSS bytes so we can inject them into
     // the self-contained HTML that the browser backend will render.
     let mut css_sheets: Vec<String> = page.styles.inline_styles.clone();
     let mut image_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    // External JS fetched in document order.  The sanitiser strips all <script>
+    // tags from the DOM, so SPA pages (React/Vue/Angular) would otherwise render
+    // blank.  Re-injecting the fetched content lets Chromium execute them from
+    // file:// without any network access (LoggingProxy still blocks all requests).
+    let mut js_scripts: Vec<String> = Vec::new();
 
     if !args.no_assets {
         // CSS
@@ -117,6 +122,45 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
                 Err(e) => tracing::warn!("failed to fetch image {}: {}", resolved_url, e),
             }
         }
+
+        // External JS — fetch in document order, cap at 2 MB per file.
+        // Inline scripts were already collected into page.scripts.inline_scripts
+        // before sanitisation; only external URLs need fetching here.
+        const JS_INLINE_LIMIT: usize = 2 * 1024 * 1024;
+        info!("fetching {} external scripts for browser render", page.scripts.external_scripts.len());
+        for script_url in &page.scripts.external_scripts {
+            match fetcher.fetch(script_url.as_str()).await {
+                Ok(r) => {
+                    if r.body.len() > JS_INLINE_LIMIT {
+                        tracing::warn!(
+                            "script {} too large ({} bytes), skipping browser inline",
+                            script_url, r.body.len()
+                        );
+                        continue;
+                    }
+                    if let Ok(s) = std::str::from_utf8(&r.body) {
+                        js_scripts.push(s.to_string());
+                    }
+                }
+                Err(e) => tracing::warn!("failed to fetch script {}: {}", script_url, e),
+            }
+        }
+        // Also re-add inline scripts collected before sanitisation.
+        for inline in &page.scripts.inline_scripts {
+            js_scripts.push(inline.clone());
+        }
+
+        // ── 4b. Inline CSS url() background/font references as data URIs ─────
+        // External `url(https://...)` values in CSS are blocked by the logging
+        // proxy at Chromium render time, producing blank backgrounds and missing
+        // decorative images.  Pre-fetching them here and rewriting to `data:`
+        // URIs lets Chromium render the page correctly inside full isolation.
+        //
+        // Must run before `sanitize_css_for_browser` (called inside HtmlInliner),
+        // which preserves `data:` URIs but strips `url(https://...)` references.
+        // After this pass, any URL we failed to fetch is still stripped by the
+        // sanitiser — so screenshot quality degrades gracefully on fetch failure.
+        css_sheets = inline_css_url_refs(css_sheets, &fetcher).await;
     }
 
     // ── 4.5. CSS overlay threat analysis ─────────────────────────────────────
@@ -132,7 +176,7 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
             rust_render(args, &page.dom, &css_sheets, &image_bytes, &mut report)?;
         } else {
             // Primary: headless browser (exact, JS enabled)
-            browser_render(args, &page, &base_url, &css_sheets, &image_bytes, &mut report)?;
+            browser_render(args, &page, &base_url, &css_sheets, &image_bytes, &js_scripts, &mut report)?;
         }
 
         // CARAPACE-08: annotate screenshot(s) with risk badge.
@@ -174,10 +218,13 @@ fn browser_render(
     base_url: &url::Url,
     css_sheets: &[String],
     image_bytes: &HashMap<String, Vec<u8>>,
+    js_scripts: &[String],
     report: &mut ThreatReport,
 ) -> Result<()> {
-    // Build a fully self-contained HTML file: inline CSS + images.
-    let inliner = HtmlInliner::new(css_sheets.to_vec(), image_bytes.clone());
+    // Build a fully self-contained HTML file: inline CSS + images + JS.
+    // Pass the real page URL so the injected <base href> fixes protocol-relative
+    // URLs in dynamically-created elements (e.g. Facebook SDK //connect.facebook.net/...).
+    let inliner = HtmlInliner::new(css_sheets.to_vec(), image_bytes.clone(), js_scripts.to_vec(), base_url.to_string());
     let self_contained_html = inliner.build_self_contained(&page.dom);
 
     // Write to a temp file with a non-predictable name.
@@ -195,14 +242,24 @@ fn browser_render(
 
     info!("self-contained HTML written to {} ({} bytes)", tmp_path.display(), self_contained_html.len());
 
+    // Resolve the User-Agent for this render.
+    // android_ua takes precedence over mobile_ua; both take precedence over default.
+    let render_ua = if args.android_ua {
+        backend::ANDROID_UA
+    } else if args.mobile_ua {
+        backend::IPHONE_UA
+    } else {
+        backend::WINDOWS_UA
+    };
+
     // Pass 1: desktop screenshot.
-    let screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height);
+    let screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
 
     // Pass 2: post-JS DOM dump (CARAPACE-02 — dynamic overlay detection).
     // Only run when the screenshot succeeded: confirms Chromium is available and
     // the page rendered.  The temp file must stay alive until all passes complete.
     let dumped_dom = if screenshot_result.is_ok() {
-        backend::dump_dom(&tmp_path)
+        backend::dump_dom(&tmp_path, render_ua)
     } else {
         String::new()
     };
@@ -213,7 +270,7 @@ fn browser_render(
     // Non-fatal: a mobile render failure does not affect the desktop result.
     if args.mobile_screenshot && screenshot_result.is_ok() {
         let mobile_path = args.output.with_extension("mobile.png");
-        let _ = backend::render_to_png(&tmp_path, &mobile_path, 375, 844);
+        let _ = backend::render_to_png(&tmp_path, &mobile_path, 375, 844, render_ua);
     }
 
     // Clean up temp file after all passes.
@@ -917,6 +974,129 @@ fn is_same_site(base: &url::Url, intercepted_url: &str) -> bool {
         }
         _ => false,
     }
+}
+
+// ── CSS url() inlining ────────────────────────────────────────────────────────
+
+/// Replace `url(https://...)` references in CSS with inline `data:` URIs.
+///
+/// Fetches each unique external URL via the SSRF-protected safe fetcher and
+/// substitutes the fetched bytes as a base64-encoded data URI.  The result is
+/// self-contained CSS that Chromium can apply without any outbound requests.
+///
+/// Limits: 30 unique URLs across all sheets combined; 512 KB per resource.
+/// Fetch failures are silenced — the original `url(...)` is preserved and the
+/// CSS sanitiser will strip it at render time, which degrades gracefully.
+async fn inline_css_url_refs(sheets: Vec<String>, fetcher: &SafeFetcher) -> Vec<String> {
+    use base64::Engine as _;
+    use regex::Regex;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CSS_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let url_re = CSS_URL_RE.get_or_init(|| {
+        // Matches url(...) with absolute http/https URLs, quoted or unquoted.
+        // Capture group 1 is the raw URL (no surrounding quotes).
+        Regex::new(r#"url\(\s*["']?(https?://[^"'\)\s]{4,800})["']?\s*\)"#).unwrap()
+    });
+
+    const MAX_URLS: usize = 30;
+    const MAX_BYTES: usize = 512 * 1024; // 512 KB per resource
+
+    // Collect unique URLs across all sheets in document order.
+    let mut unique_urls: Vec<String> = Vec::with_capacity(8);
+    'outer: for sheet in &sheets {
+        for cap in url_re.captures_iter(sheet) {
+            let url = cap[1].to_string();
+            if !unique_urls.contains(&url) {
+                unique_urls.push(url);
+                if unique_urls.len() >= MAX_URLS {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if unique_urls.is_empty() {
+        return sheets;
+    }
+
+    info!("inlining {} CSS url() resource(s) as data URIs", unique_urls.len());
+
+    // Fetch each unique URL once and build a rewrite cache.
+    let mut cache: HashMap<String, String> = HashMap::with_capacity(unique_urls.len());
+    for url in &unique_urls {
+        match fetcher.fetch(url).await {
+            Ok(r) if !r.body.is_empty() && r.body.len() <= MAX_BYTES => {
+                let mime = guess_resource_mime(&r.body, &r.content_type, url);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&r.body);
+                cache.insert(url.clone(), format!("url('data:{};base64,{}')", mime, b64));
+            }
+            Ok(r) => warn!("CSS url() resource too large or empty ({} B), skipping: {}", r.body.len(), url),
+            Err(e) => warn!("CSS url() fetch failed for {}: {}", url, e),
+        }
+    }
+
+    // Rewrite each sheet: substitute cached data URIs, leave others untouched.
+    sheets
+        .into_iter()
+        .map(|sheet| {
+            url_re
+                .replace_all(&sheet, |caps: &regex::Captures| {
+                    let raw = &caps[1];
+                    cache.get(raw).cloned().unwrap_or_else(|| caps[0].to_string())
+                })
+                .into_owned()
+        })
+        .collect()
+}
+
+/// Determine the MIME type for a CSS-referenced resource.
+///
+/// Prefers the server-provided `Content-Type` header, falls back to magic bytes,
+/// then to the URL file extension.  Returns a `&'static str` suitable for a
+/// `data:` URI scheme.
+fn guess_resource_mime(bytes: &[u8], content_type: &str, url: &str) -> &'static str {
+    // Use the Content-Type header when it clearly identifies the format.
+    let ct = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match ct.as_str() {
+        "image/png"                     => return "image/png",
+        "image/jpeg"                    => return "image/jpeg",
+        "image/gif"                     => return "image/gif",
+        "image/webp"                    => return "image/webp",
+        "image/svg+xml"                 => return "image/svg+xml",
+        "image/avif"                    => return "image/avif",
+        "image/x-icon" | "image/vnd.microsoft.icon" => return "image/x-icon",
+        "font/woff2"   | "application/font-woff2"   => return "font/woff2",
+        "font/woff"    | "application/font-woff"    => return "font/woff",
+        "font/ttf"     | "application/x-font-ttf"   => return "font/ttf",
+        "font/otf"     | "application/x-font-otf"   => return "font/otf",
+        "application/vnd.ms-fontobject"             => return "application/vnd.ms-fontobject",
+        _ => {}
+    }
+    // Magic bytes — reliable regardless of what the server claims.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n")                         { return "image/png"; }
+    if bytes.starts_with(b"\xff\xd8\xff")                               { return "image/jpeg"; }
+    if bytes.starts_with(b"GIF8")                                       { return "image/gif"; }
+    if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" { return "image/webp"; }
+    if bytes.starts_with(b"wOF2")                                       { return "font/woff2"; }
+    if bytes.starts_with(b"wOFF")                                       { return "font/woff"; }
+    if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml")       { return "image/svg+xml"; }
+    // URL extension as last resort — strip query string first.
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".svg")                       { return "image/svg+xml"; }
+    if path.ends_with(".png")                       { return "image/png"; }
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") { return "image/jpeg"; }
+    if path.ends_with(".gif")                       { return "image/gif"; }
+    if path.ends_with(".webp")                      { return "image/webp"; }
+    if path.ends_with(".avif")                      { return "image/avif"; }
+    if path.ends_with(".ico")                       { return "image/x-icon"; }
+    if path.ends_with(".woff2")                     { return "font/woff2"; }
+    if path.ends_with(".woff")                      { return "font/woff"; }
+    if path.ends_with(".ttf")                       { return "font/ttf"; }
+    if path.ends_with(".otf")                       { return "font/otf"; }
+    if path.ends_with(".eot")                       { return "application/vnd.ms-fontobject"; }
+    "application/octet-stream"
 }
 
 fn rasterise_svg(bytes: &[u8]) -> Option<image::DynamicImage> {

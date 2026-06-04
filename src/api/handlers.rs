@@ -54,6 +54,20 @@ pub struct RenderRequest {
     /// that only appears at narrow widths.
     #[serde(default)]
     pub mobile_screenshot: bool,
+
+    /// Use an iPhone/Safari User-Agent for the page fetch and Chromium render.
+    /// Enables detection of pages that cloak content from non-iPhone browsers
+    /// via `Vary: User-Agent` — serving a blank placeholder to desktop UAs while
+    /// showing the real phishing page to iPhone/Safari visitors.
+    #[serde(default)]
+    pub mobile_ua: bool,
+
+    /// Use an Android/Chrome User-Agent instead of iPhone.
+    /// Fallback for pages that cloak specifically from iOS or that target
+    /// Android users (banking apps, Google account phishing, etc.).
+    /// Takes precedence over `mobile_ua` when both are set.
+    #[serde(default)]
+    pub android_ua: bool,
 }
 
 fn default_format() -> String { "png".into() }
@@ -168,6 +182,8 @@ pub async fn render(
         width: req.width,
         height: req.height,
         mobile_screenshot: req.mobile_screenshot,
+        mobile_ua: req.mobile_ua,
+        android_ua: req.android_ua,
         // Threat report is returned inline — no sidecar file needed.
         threat_report: false,
         no_js_sandbox: req.no_js_sandbox,
@@ -339,6 +355,7 @@ pub async fn analyse(
             max_redirects: 5,
             timeout_secs: state.timeout_secs,
             no_assets: false,
+            user_agent: None,
         };
         let fetcher = match SafeFetcher::new(options) {
             Ok(f) => f,

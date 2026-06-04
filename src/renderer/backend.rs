@@ -27,19 +27,102 @@ const FULL_PAGE_SENTINEL_H: u32 = 8000;
 /// legitimate page (404, landing page, redirect stub) to a near-zero sliver.
 const MIN_SCREENSHOT_H: u32 = 400;
 
+/// Default User-Agent: Windows 10 Chrome — triggers Windows-targeted attack
+/// payloads (ClickFix, SocGholish) and is less likely to be blocked as a bot.
+pub const WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
+/// iPhone/Safari User-Agent for reaching pages that cloak their content
+/// from non-mobile browsers via `Vary: User-Agent` server-side fingerprinting.
+pub const IPHONE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+
+/// Android/Chrome User-Agent — fallback when iPhone UA still returns blank
+/// (pages that specifically cloak from iOS or require Android UA).
+pub const ANDROID_UA: &str = "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36";
+
+/// Proxy bypass list applied to every Chromium render.
+///
+/// Chromium normally routes all requests through the logging proxy, which
+/// immediately returns 503 — blocking external resources and causing blank
+/// images, unstyled pages, and missing social widgets.  Bypassing well-known
+/// CDNs that serve only static assets improves screenshot fidelity across all
+/// pages without weakening the security model: none of these domains are
+/// attacker-controlled, so they cannot serve C2 payloads or exfiltrate data
+/// on behalf of the page being scanned.
+///
+/// Intentionally EXCLUDED (can serve arbitrary / attacker-controlled content):
+///   cloudflare.com, cloudfront.net, fastly.net, akamaihd.net — generic CDNs
+///   vercel.app, netlify.app, github.io, glitch.me, replit.app — free hosts
+///   azureedge.net, storage.googleapis.com — blob/object storage
+///
+/// Format: `.example.com` matches `example.com` AND all its subdomains.
+/// Exact-host entries (no leading dot) are used only where a subdomain but
+/// not the parent registrable domain should be bypassed (e.g. cdnjs).
+pub const CDN_PROXY_BYPASS: &str = concat!(
+    // Google — APIs, fonts, reCAPTCHA, GTM, analytics, YouTube, DoubleClick
+    ".googleapis.com,.gstatic.com,.google.com,",
+    ".googletagmanager.com,.google-analytics.com,",
+    ".googlesyndication.com,.doubleclick.net,",
+    ".youtube.com,.ytimg.com,.youtube-nocookie.com,",
+    ".recaptcha.net,",
+    // Meta / Facebook — SDK, social login widgets, CDN
+    ".facebook.com,.facebook.net,.fbcdn.net,",
+    // Twitter / X — widgets.js, embed iframe assets
+    ".twitter.com,.twimg.com,.x.com,",
+    // LinkedIn — insight tag, embedded posts
+    ".linkedin.com,.licdn.com,",
+    // Instagram — oEmbed scripts and images
+    ".instagram.com,",
+    // TikTok, Pinterest, Snapchat, Reddit — social embeds
+    ".tiktok.com,.pinterest.com,.snapchat.com,.reddit.com,",
+    // Vimeo — video embeds
+    ".vimeo.com,.vimeocdn.com,",
+    // Microsoft — auth widgets (microsoftonline), Clarity analytics
+    ".microsoft.com,.microsoftonline.com,.clarity.ms,",
+    // Apple — iCloud UI, Apple ID, App Store badges, mzstatic image CDN
+    ".apple.com,.icloud.com,.mzstatic.com,.cdn-apple.com,.icloud-content.com,",
+    // Open-source library CDNs
+    ".jsdelivr.net,.bootstrapcdn.com,.jquery.com,.fontawesome.com,",
+    // cdnjs — Cloudflare's open-source library CDN (subdomain only;
+    // cloudflare.com itself is deliberately excluded)
+    "cdnjs.cloudflare.com,",
+    // GitHub — static asset CDN (JS bundles, avatars; not github.io free hosting)
+    ".githubassets.com,.githubusercontent.com,",
+    // Adobe Fonts (Typekit) — webfont delivery
+    ".typekit.com,.typekit.net,",
+    // Shopify CDN and payment — used by Shopify-built pages
+    ".shopifycdn.com,.shop.app,",
+    // WordPress CDN — stats.wp.com, s.wp.com, i.wp.com (not wordpress.com hosting)
+    ".wp.com,",
+    // Analytics that gate page content — pages may defer rendering until loaded
+    ".hotjar.com,.clarity.ms,.segment.com,.segment.io,",
+    // Error monitoring — passive; does not affect page rendering but widely used
+    ".sentry.io,.sentry-cdn.com,",
+    // Payment SDKs — needed for checkout pages to render form elements
+    ".stripe.com,.stripecdn.com,.paypal.com,.paypalobjects.com,",
+    // Consent / cookie-banner platforms — some pages block all content until
+    // the consent script initialises
+    ".onetrust.com,.cookielaw.org,.cookiebot.com,.iubenda.com,",
+    // hCaptcha — legitimate CAPTCHA (distinct from Cloudflare Turnstile)
+    ".hcaptcha.com"
+);
+
 use crate::error::{CarapaceError, Result};
 
 /// Render `html_path` to `output_path` (PNG) using the best available backend.
+/// `ua` controls the User-Agent Chromium presents during render — use
+/// `WINDOWS_UA` for the default Windows-Chrome identity or `IPHONE_UA` to
+/// reach pages that gate their content on a mobile browser.
 /// Returns the list of URLs that JavaScript attempted to fetch at runtime.
 pub fn render_to_png(
     html_path: &Path,
     output_path: &Path,
     width: u32,
     height: u32,
+    ua: &str,
 ) -> Result<Vec<String>> {
     if chromium_available() {
-        info!("rendering with Chromium (JS enabled, network isolated)");
-        match render_chromium(html_path, output_path, width, height) {
+        info!("rendering with Chromium (JS enabled, network isolated, ua={})", &ua[..40.min(ua.len())]);
+        match render_chromium(html_path, output_path, width, height, ua) {
             Ok(intercepted) => return Ok(intercepted),
             Err(e) => warn!("Chromium render failed, trying wkhtmltoimage: {}", e),
         }
@@ -132,9 +215,14 @@ fn handle_proxy_connection(stream: &mut TcpStream, intercepted: &Mutex<Vec<Strin
         }
     }
     // Reject the connection.  For CONNECT (HTTPS): 503.  For plain HTTP: also 503.
+    // Immediately shutdown both halves of the socket after the response so
+    // Chromium marks this fetch as complete and virtual-time can advance.
+    // Without the shutdown(), half-open sockets hold the "pending fetches"
+    // counter above zero and --virtual-time-budget never elapses.
     let _ = stream.write_all(
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn extract_proxy_target(request: &str) -> Option<String> {
@@ -255,6 +343,7 @@ fn render_chromium(
     output_path: &Path,
     width: u32,
     height: u32,  // 0 = full-page: use FULL_PAGE_SENTINEL_H, then trim whitespace
+    ua: &str,
 ) -> Result<Vec<String>> {
     let full_page = height == 0;
     let render_h  = if full_page { FULL_PAGE_SENTINEL_H } else { height };
@@ -262,6 +351,7 @@ fn render_chromium(
     let file_url = format!("file://{}", html_path.display());
     let screenshot_arg = format!("--screenshot={}", output_path.display());
     let window_size = format!("--window-size={},{}", width, render_h);
+    let ua_arg = format!("--user-agent={}", ua);
 
     // Start the logging proxy — replaces the silent dead-socks5.
     // All requests still fail (connection refused immediately), but we
@@ -269,50 +359,60 @@ fn render_chromium(
     let proxy = LoggingProxy::start();
     let proxy_arg = proxy.proxy_arg();
 
-    let out = Command::new(chromium_cmd())
-        .args([
-            "--headless=new",
-            // JavaScript is ENABLED — the dead proxy prevents exfiltration.
-            // Without JS, dynamic overlays (ClickFix, SocGholish, drainers)
-            // never render and would be invisible in the screenshot and DOM.
-            "--no-sandbox",
-            "--disable-gpu",
-            "--use-angle=swiftshader",
-            "--disable-dev-shm-usage",
-            "--disable-background-networking",
-            "--disable-default-apps",
-            "--disable-extensions",
-            "--disable-sync",
-            "--no-first-run",
-            "--hide-scrollbars",
-            // Suppress the `navigator.webdriver = true` flag and related
-            // automation indicators so that evasive scripts actually execute
-            // their attack path rather than their clean-for-scanner path.
-            "--disable-blink-features=AutomationControlled",
-            // Spoof a Windows 10 Chrome user-agent so that ClickFix, SocGholish,
-            // and other Windows-targeted campaigns see a plausible victim browser
-            // rather than a Linux headless instance and skip their delivery logic.
-            // navigator.platform is overridden in the injected bootstrap script
-            // (see HtmlInliner::build_self_contained) for JS-level OS checks.
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            // Virtual time budget: allow CSS transitions and JS timers up to
-            // 5s to settle before the screenshot is taken — catches attacks
-            // that delay their overlay by a short timeout to evade scanners.
-            "--virtual-time-budget=5000",
-            // Ensure all compositor stages (layout, paint, compositing) complete
-            // before the screenshot is captured, preventing blank/partial renders
-            // on slow-rendering pages.
-            "--run-all-compositor-stages-before-draw",
-            // Network isolation: route all requests through our logging proxy.
-            // It records attempted URLs and immediately rejects connections.
-            &proxy_arg,
-            "--disable-remote-fonts",
-            "--force-color-profile=srgb",
-            &window_size,
-            &screenshot_arg,
-            &file_url,
-        ])
-        .output()
+    // Always bypass the logging proxy for well-known CDNs.
+    // This lets Chromium load fonts, social widgets, Apple imagery, and
+    // payment form scripts directly, eliminating the most common causes of
+    // blank or unstyled screenshots across all page types.
+    let bypass_arg = format!("--proxy-bypass-list={}", CDN_PROXY_BYPASS);
+
+    let mut cmd = Command::new(chromium_cmd());
+    cmd.args([
+        "--headless=new",
+        // JavaScript is ENABLED — the dead proxy prevents exfiltration.
+        // Without JS, dynamic overlays (ClickFix, SocGholish, drainers)
+        // never render and would be invisible in the screenshot and DOM.
+        "--no-sandbox",
+        "--disable-gpu",
+        "--use-angle=swiftshader",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--no-first-run",
+        "--hide-scrollbars",
+        // Suppress the `navigator.webdriver = true` flag and related
+        // automation indicators so that evasive scripts actually execute
+        // their attack path rather than their clean-for-scanner path.
+        "--disable-blink-features=AutomationControlled",
+        // User-Agent: passed by the caller.  Default is Windows Chrome to
+        // trigger Windows-targeted payloads (ClickFix, SocGholish).
+        // iPhone/Android UA is used when the server cloaks content by device.
+        // navigator.platform is overridden in the injected bootstrap script
+        // (see HtmlInliner::build_self_contained) for JS-level OS checks.
+        &ua_arg,
+        // Virtual time budget: allow CSS transitions and JS timers up to
+        // 5s to settle before the screenshot is taken — catches attacks
+        // that delay their overlay by a short timeout to evade scanners.
+        "--virtual-time-budget=5000",
+        // Ensure all compositor stages (layout, paint, compositing) complete
+        // before the screenshot is captured, preventing blank/partial renders
+        // on slow-rendering pages.
+        "--run-all-compositor-stages-before-draw",
+        // Network isolation: route all requests through our logging proxy.
+        // It records attempted URLs and immediately rejects connections.
+        &proxy_arg,
+        "--disable-remote-fonts",
+        "--force-color-profile=srgb",
+        // Real-wallclock safety net: screenshots whatever is rendered after
+        // 8 s even if --virtual-time-budget stalls on half-open connections.
+        "--timeout=8000",
+        &window_size,
+        &screenshot_arg,
+        &file_url,
+    ]);
+    cmd.arg(&bypass_arg);
+    let out = cmd.output()
         .map_err(|e| CarapaceError::Render(format!("chromium launch: {}", e)))?;
 
     // Collect URLs the page attempted to reach at runtime.
@@ -443,12 +543,13 @@ fn render_wkhtmltoimage(html_path: &Path, output_path: &Path, width: u32) -> Res
 ///
 /// Returns the serialised DOM as a `String`.  Returns an empty string on any failure;
 /// DOM-dump failure is non-fatal and does not affect the screenshot result.
-pub fn dump_dom(html_path: &Path) -> String {
+pub fn dump_dom(html_path: &Path, ua: &str) -> String {
     if !chromium_available() {
         return String::new();
     }
 
     let file_url = format!("file://{}", html_path.display());
+    let ua_arg = format!("--user-agent={}", ua);
 
     // Run with the same network isolation as the screenshot pass — all requests still
     // fail, preventing any exfiltration during this second Chromium invocation.
@@ -468,9 +569,13 @@ pub fn dump_dom(html_path: &Path) -> String {
             "--disable-sync",
             "--no-first-run",
             "--disable-blink-features=AutomationControlled",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            &ua_arg,
             "--virtual-time-budget=5000",
             "--run-all-compositor-stages-before-draw",
+            // Same wallclock safety net as the screenshot pass — prevents Chromium
+            // from hanging indefinitely on pages with JS that blocks process exit
+            // (e.g. ClickFix clipboard event loops, busy-wait anti-debug patterns).
+            "--timeout=8000",
             &proxy_arg,
             "--dump-dom",
             &file_url,

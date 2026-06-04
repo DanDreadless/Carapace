@@ -23,10 +23,14 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
         );
     }
 
+    // Pre-scan: detect navigator.userAgent presence for webdriver suppression logic.
+    let has_user_agent_check = source.contains("navigator.userAgent");
+
     let mut visitor = SecurityVisitor {
         report,
         source_name: source_name.to_string(),
         source: source.to_string(),
+        has_user_agent_check,
     };
     visitor.visit_program(&result.program);
 }
@@ -35,6 +39,10 @@ struct SecurityVisitor<'r> {
     report: &'r mut ThreatReport,
     source_name: String,
     source: String,
+    /// True when navigator.userAgent appears anywhere in the source.
+    /// Used to suppress webdriver probes that are part of a bot-UA AND-chain
+    /// (Framer URL-parameter-preservation pattern) rather than standalone cloaking gates.
+    has_user_agent_check: bool,
 }
 
 impl SecurityVisitor<'_> {
@@ -289,14 +297,27 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             let loc = self.loc(expr.span.start);
 
             match (obj_name, prop) {
-                // navigator.webdriver — THE headless detection property.
-                // No legitimate code reads this; only anti-bot scripts do.
+                // navigator.webdriver — headless detection property.
+                // Suppress when: negated (!navigator.webdriver), in an && chain, AND
+                // navigator.userAgent is also accessed in this script — this is the Framer
+                // URL-parameter-preservation pattern, not a cloaking gate.
                 ("navigator", "webdriver") => {
-                    self.report.add_js_flag(JsFlag::SandboxEvasion {
-                        technique: "webdriver_check".into(),
-                        detail: "navigator.webdriver accessed — headless browser detection".into(),
-                        loc,
-                    });
+                    let start = expr.span.start as usize;
+                    let end = expr.span.end as usize;
+                    let src = &self.source;
+                    let is_negated = start > 0 && src.as_bytes().get(start - 1).copied() == Some(b'!');
+                    let window_start = start.saturating_sub(20);
+                    let window_end = (end + 20).min(src.len());
+                    let has_and_chain = src.get(window_start..window_end).map_or(false, |w| w.contains("&&"));
+                    if self.has_user_agent_check && is_negated && has_and_chain {
+                        // Framer URL-param preservation: !navigator.webdriver && !botUA — not cloaking.
+                    } else {
+                        self.report.add_js_flag(JsFlag::SandboxEvasion {
+                            technique: "webdriver_check".into(),
+                            detail: "navigator.webdriver accessed — headless browser detection".into(),
+                            loc,
+                        });
+                    }
                 }
                 // window.outerHeight / window.outerWidth — both are 0 in headless.
                 ("window", "outerHeight" | "outerWidth") => {
