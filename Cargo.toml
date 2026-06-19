@@ -86,10 +86,12 @@ chrono      = { version = "0.4.44", features = ["serde"] }
 sha2        = "0.10"
 resvg = "0.47.0"
 usvg = "0.47.0"
+rqrr        = "0.9"   # pure-Rust QR-code reader (quishing detection)
 
 [dev-dependencies]
 tokio-test  = "0.4.5"
 mockito     = "1"
+qrcode      = "0.14"  # QR encoder — round-trip tests for the quishing decoder
 
 [profile.release]
 opt-level = 3

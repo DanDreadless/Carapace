@@ -335,6 +335,16 @@ impl ThreatReport {
         self.recalculate_score();
     }
 
+    /// Record QR code(s) decoded from page imagery whose payload is a URL.
+    /// Quishing (QR phishing) hides the malicious link inside an image to defeat
+    /// text/URL scanners. LOW in Rust — the Python layer escalates to MEDIUM when
+    /// the decoded URL points to an external (non-known-good) domain, and context
+    /// collapse raises it further on a brand-impersonating page.
+    pub fn add_qr_code_url(&mut self, detail: &str) {
+        self.push_flag(Severity::Low, "QR_CODE_URL", detail.to_string());
+        self.recalculate_score();
+    }
+
     /// Record a Browser-in-the-Browser (BitB) fake credential window: a brand
     /// login URL rendered as page text inside fake browser-window chrome over a
     /// credential capture, on a non-official domain.  The victim "verifies" an

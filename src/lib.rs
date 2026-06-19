@@ -179,6 +179,11 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
             browser_render(args, &page, &base_url, &css_sheets, &image_bytes, &js_scripts, &mut report)?;
         }
 
+        // Quishing: decode QR codes from the page images + the rendered screenshot
+        // (before the risk badge is composited onto it) and flag URL payloads.
+        let _qr_shot = if args.output.exists() { Some(args.output.as_path()) } else { None };
+        crate::renderer::detect_qr_codes(&image_bytes, _qr_shot, &mut report);
+
         // CARAPACE-08: annotate screenshot(s) with risk badge.
         // Called after render so risk_score reflects all findings including DOM dump.
         let domain    = base_url.host_str().unwrap_or("unknown");

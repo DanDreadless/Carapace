@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::error::{CarapaceError, Result};
 use crate::layout::{LayoutNode, LayoutTree, TextAlign};
+use crate::threat::ThreatReport;
 
 /// Decoded images keyed by the original `src` attribute value from HTML.
 pub type ImageCache = HashMap<String, DynamicImage>;
@@ -376,6 +377,73 @@ fn draw_text_rgba(img: &mut image::RgbaImage, font: &FontArc, text: &str, mut x:
     }
 }
 
+// ── Quishing (QR-code phishing) detection ──────────────────────────────────────
+
+/// Decode any QR codes in a single image and append URL-shaped payloads to `out`.
+/// Uses our `image` crate to produce a greyscale buffer, then feeds raw luma to
+/// rqrr via a closure so there is no coupling to rqrr's own image-crate version.
+fn decode_qr_image(img: &DynamicImage, out: &mut Vec<String>) {
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    if w < 20 || h < 20 || w > 8192 || h > 8192 {
+        return;
+    }
+    let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(
+        w as usize,
+        h as usize,
+        |x, y| gray.get_pixel(x as u32, y as u32)[0],
+    );
+    for grid in prepared.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            if !content.is_empty() && !out.contains(&content) {
+                out.push(content);
+            }
+        }
+    }
+}
+
+/// Return true if a decoded QR payload is a navigable URL — the quishing vector.
+fn qr_payload_is_url(content: &str) -> bool {
+    let l = content.to_ascii_lowercase();
+    if l.starts_with("http://") || l.starts_with("https://") || l.contains("://") {
+        return true;
+    }
+    // Bare host form ("login.evil.com/x") with no spaces and a dot.
+    content.contains('.') && !content.contains(char::is_whitespace) && content.len() <= 256
+}
+
+/// Decode QR codes from the page's fetched `<img>` resources (full resolution) and
+/// the rendered screenshot (catches JS-canvas / CSS-background QR), and record any
+/// URL payloads as a `QR_CODE_URL` flag.
+pub fn detect_qr_codes(
+    image_bytes: &HashMap<String, Vec<u8>>,
+    screenshot: Option<&Path>,
+    report: &mut ThreatReport,
+) {
+    let mut decoded: Vec<String> = Vec::new();
+
+    for bytes in image_bytes.values() {
+        if let Ok(img) = image::load_from_memory(bytes) {
+            decode_qr_image(&img, &mut decoded);
+        }
+    }
+    if let Some(path) = screenshot {
+        if let Ok(img) = image::open(path) {
+            decode_qr_image(&img, &mut decoded);
+        }
+    }
+
+    let urls: Vec<String> = decoded.into_iter().filter(|c| qr_payload_is_url(c)).collect();
+    if urls.is_empty() {
+        return;
+    }
+    let detail = format!(
+        "decoded QR code URL(s):\n{}",
+        urls.iter().take(5).map(|u| format!("  {}", u)).collect::<Vec<_>>().join("\n")
+    );
+    report.add_qr_code_url(&detail);
+}
+
 /// Composite a risk annotation badge onto the bottom of a PNG screenshot in place.
 ///
 /// Badge layout (36 px strip, full width):
@@ -460,4 +528,55 @@ fn clip_rect(r: &crate::layout::LayoutRect, pw: u32, ph: u32) -> Option<SkRect> 
     let h = (r.height - (y - r.y)).min(ph as f32 - y);
     if w < 0.5 || h < 0.5 { return None; }
     SkRect::from_xywh(x, y, w, h)
+}
+
+#[cfg(test)]
+mod qr_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Render a QR code for `data` into an in-memory PNG byte vector.
+    fn qr_png(data: &str) -> Vec<u8> {
+        let code = qrcode::QrCode::new(data.as_bytes()).unwrap();
+        let img = code
+            .render::<image::Luma<u8>>()
+            .min_dimensions(300, 300)
+            .quiet_zone(true)
+            .build();
+        let dynimg = image::DynamicImage::ImageLuma8(img);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        dynimg.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn decodes_url_qr_from_image_bytes() {
+        let mut images: HashMap<String, Vec<u8>> = HashMap::new();
+        images.insert("qr.png".into(), qr_png("https://evil-login.example/harvest"));
+        let mut report = ThreatReport::new("https://lure.test/");
+        detect_qr_codes(&images, None, &mut report);
+        assert!(report.has_flag_code("QR_CODE_URL"));
+    }
+
+    #[test]
+    fn ignores_non_url_qr() {
+        let mut images: HashMap<String, Vec<u8>> = HashMap::new();
+        images.insert("qr.png".into(), qr_png("just some plain text without a dot"));
+        let mut report = ThreatReport::new("https://lure.test/");
+        detect_qr_codes(&images, None, &mut report);
+        assert!(!report.has_flag_code("QR_CODE_URL"));
+    }
+
+    #[test]
+    fn no_flag_when_no_qr() {
+        // A plain 100x100 white image contains no QR code.
+        let img = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(100, 100, image::Luma([255u8])));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let mut images: HashMap<String, Vec<u8>> = HashMap::new();
+        images.insert("blank.png".into(), buf.into_inner());
+        let mut report = ThreatReport::new("https://x.test/");
+        detect_qr_codes(&images, None, &mut report);
+        assert!(!report.has_flag_code("QR_CODE_URL"));
+    }
 }
