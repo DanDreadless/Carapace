@@ -335,6 +335,21 @@ impl ThreatReport {
         self.recalculate_score();
     }
 
+    /// Record a Browser-in-the-Browser (BitB) fake credential window: a brand
+    /// login URL rendered as page text inside fake browser-window chrome over a
+    /// credential capture, on a non-official domain.  The victim "verifies" an
+    /// attacker-controlled URL string, not the real address bar.  CRITICAL — no
+    /// legitimate page renders another brand's login URL inside a fake window
+    /// frame above a password field.
+    pub fn add_bitb_fake_window(&mut self, detail: &str) {
+        self.push_flag(
+            Severity::Critical,
+            "BITB_FAKE_WINDOW",
+            detail.to_string(),
+        );
+        self.recalculate_score();
+    }
+
     /// Record URLs that JavaScript attempted to fetch at runtime (intercepted
     /// by the logging proxy and rejected).  A single finding is emitted with
     /// all unique domains listed in the evidence block.

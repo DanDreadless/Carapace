@@ -384,8 +384,6 @@ fn draw_text_rgba(img: &mut image::RgbaImage, font: &FontArc, text: &str, mut x:
 /// Colours are keyed to Carapace risk score (≥40 MALICIOUS red, ≥20 SUSPICIOUS orange,
 /// ≥1 ELEVATED amber, 0 CLEAN green).  No-ops on any load/save failure.
 pub fn annotate_screenshot(path: &Path, risk_score: u8, domain: &str, scan_time: &str) {
-    use image::GenericImage as _;
-
     let mut img = match image::open(path) {
         Ok(i)  => i.to_rgba8(),
         Err(e) => { warn!("annotate_screenshot: open {:?}: {}", path, e); return; }
