@@ -300,6 +300,8 @@ impl ThreatReport {
                     "regsvr32", "wscript", "cscript", "base64 -d",
                     // LoLBAS / DNS-staging and CrashFix (KongTuke, Jan 2026) additions:
                     "msiexec", "nslookup", "reg add", "taskkill", "cmdkey", "net use",
+                    // Additional LoLBAS download/exec proxies — FileFix/CrashFix/DNS variants (2026)
+                    "bitsadmin", "forfiles", "conhost", "mavinject", "ftp -s",
                 ]
                 .iter()
                 .any(|kw| lower.contains(kw));
