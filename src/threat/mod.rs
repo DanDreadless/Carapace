@@ -106,6 +106,18 @@ pub struct ThreatReport {
     #[serde(default)]
     pub render_skipped: bool,
 
+    /// Set to true when the delivered screenshot is visually blank (effectively
+    /// all near-white pixels) after the in-process retry ladder was exhausted.
+    /// Lets the caller discard a white PNG that would otherwise pass a byte-size
+    /// check, and lets scoring treat the visual as unreliable. (CARAPACE-09 / P1)
+    #[serde(default)]
+    pub render_blank: bool,
+
+    /// Fraction of near-white pixels (0.0–1.0) in the delivered desktop
+    /// screenshot — the measurement behind `render_blank`, surfaced for tuning.
+    #[serde(default)]
+    pub blank_ratio: f32,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -122,6 +134,8 @@ impl ThreatReport {
             tech_stack: Vec::new(),
             risk_score: 0,
             render_skipped: false,
+            render_blank: false,
+            blank_ratio: 0.0,
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),

@@ -120,9 +120,23 @@ pub fn render_to_png(
     height: u32,
     ua: &str,
 ) -> Result<Vec<String>> {
+    render_to_png_ex(html_path, output_path, width, height, ua, 0)
+}
+
+/// As `render_to_png`, but with a settle budget in milliseconds.  `settle_ms == 0`
+/// uses the default (5000 ms).  A longer budget is used by the blank-render retry
+/// to give slow CSS/font/animation paints more time to finish before capture.
+pub fn render_to_png_ex(
+    html_path: &Path,
+    output_path: &Path,
+    width: u32,
+    height: u32,
+    ua: &str,
+    settle_ms: u32,
+) -> Result<Vec<String>> {
     if chromium_available() {
         info!("rendering with Chromium (JS enabled, network isolated, ua={})", &ua[..40.min(ua.len())]);
-        match render_chromium(html_path, output_path, width, height, ua) {
+        match render_chromium(html_path, output_path, width, height, ua, settle_ms) {
             Ok(intercepted) => return Ok(intercepted),
             Err(e) => warn!("Chromium render failed, trying wkhtmltoimage: {}", e),
         }
@@ -344,9 +358,15 @@ fn render_chromium(
     width: u32,
     height: u32,  // 0 = full-page: use FULL_PAGE_SENTINEL_H, then trim whitespace
     ua: &str,
+    settle_ms: u32,  // 0 = default 5000 ms virtual-time budget
 ) -> Result<Vec<String>> {
     let full_page = height == 0;
     let render_h  = if full_page { FULL_PAGE_SENTINEL_H } else { height };
+
+    // Virtual-time budget (settle) and the real-wallclock safety net derived from it.
+    let vtb = if settle_ms == 0 { 5000 } else { settle_ms };
+    let vtb_arg = format!("--virtual-time-budget={}", vtb);
+    let timeout_arg = format!("--timeout={}", vtb + 3000);
 
     let file_url = format!("file://{}", html_path.display());
     let screenshot_arg = format!("--screenshot={}", output_path.display());
@@ -391,10 +411,10 @@ fn render_chromium(
         // navigator.platform is overridden in the injected bootstrap script
         // (see HtmlInliner::build_self_contained) for JS-level OS checks.
         &ua_arg,
-        // Virtual time budget: allow CSS transitions and JS timers up to
-        // 5s to settle before the screenshot is taken — catches attacks
-        // that delay their overlay by a short timeout to evade scanners.
-        "--virtual-time-budget=5000",
+        // Virtual time budget: allow CSS transitions and JS timers to settle
+        // before the screenshot is taken (default 5s; raised by the blank-render
+        // retry) — also catches attacks that delay their overlay to evade scanners.
+        &vtb_arg,
         // Ensure all compositor stages (layout, paint, compositing) complete
         // before the screenshot is captured, preventing blank/partial renders
         // on slow-rendering pages.
@@ -404,9 +424,9 @@ fn render_chromium(
         &proxy_arg,
         "--disable-remote-fonts",
         "--force-color-profile=srgb",
-        // Real-wallclock safety net: screenshots whatever is rendered after
-        // 8 s even if --virtual-time-budget stalls on half-open connections.
-        "--timeout=8000",
+        // Real-wallclock safety net: screenshots whatever is rendered after the
+        // budget + 3 s even if --virtual-time-budget stalls on half-open connections.
+        &timeout_arg,
         &window_size,
         &screenshot_arg,
         &file_url,
@@ -445,6 +465,62 @@ fn render_chromium(
                 .join(" | ")
         )))
     }
+}
+
+// ── Blank-screenshot detection (CARAPACE-09 / P1) ──────────────────────────────
+
+/// A screenshot counts as visually blank when at least this fraction of its
+/// sampled pixels are near-white.  Set high (99.4%) so a real but content-light
+/// page (404, simple landing, redirect notice) — which always has a header,
+/// logo, or text contributing non-white pixels — is NOT misclassified as blank.
+pub const BLANK_WHITE_RATIO: f32 = 0.994;
+
+/// Fraction of near-white pixels (0.0–1.0) in a PNG, sampled on a grid for speed.
+/// A pixel is "near-white" when R, G, B are all ≥ 245.  Returns 1.0 (treat as
+/// blank) when the image cannot be read.  Sampling caps work at ~200×200 points
+/// so this is cheap even on an 8000 px full-page capture.
+pub fn screenshot_blank_ratio(path: &Path) -> f32 {
+    use image::GenericImageView as _;
+
+    let img = match image::open(path) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("screenshot_blank_ratio: open {:?}: {}", path, e);
+            return 1.0;
+        }
+    };
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return 1.0;
+    }
+    let rgba = img.to_rgba8();
+
+    let step_x = (w / 200).max(1);
+    let step_y = (h / 200).max(1);
+    let mut total = 0u64;
+    let mut near_white = 0u64;
+    let mut y = 0;
+    while y < h {
+        let mut x = 0;
+        while x < w {
+            let px = rgba.get_pixel(x, y);
+            total += 1;
+            if px[0] >= 245 && px[1] >= 245 && px[2] >= 245 {
+                near_white += 1;
+            }
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if total == 0 {
+        return 1.0;
+    }
+    near_white as f32 / total as f32
+}
+
+/// True when a screenshot is visually blank (≥ `BLANK_WHITE_RATIO` near-white).
+pub fn is_blank_screenshot(path: &Path) -> bool {
+    screenshot_blank_ratio(path) >= BLANK_WHITE_RATIO
 }
 
 // ── Full-page whitespace trim ─────────────────────────────────────────────────
@@ -606,4 +682,63 @@ fn which_exists(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod blank_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TmpPng(std::path::PathBuf);
+    impl Drop for TmpPng {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+
+    fn write_png(img: image::RgbaImage) -> TmpPng {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "carapace_blanktest_{}_{}.png", std::process::id(), n));
+        image::DynamicImage::ImageRgba8(img).save(&path).unwrap();
+        TmpPng(path)
+    }
+
+    #[test]
+    fn all_white_is_blank() {
+        let f = write_png(image::RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255])));
+        assert!(is_blank_screenshot(&f.0));
+        assert!(screenshot_blank_ratio(&f.0) >= 0.999);
+    }
+
+    #[test]
+    fn content_page_is_not_blank() {
+        // A mostly-white page with a header bar + text region (~5% non-white).
+        let mut img = image::RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255]));
+        for y in 0..40 {            // top header bar
+            for x in 0..800 { img.put_pixel(x, y, image::Rgba([20, 30, 60, 255])); }
+        }
+        for y in 100..160 {         // a block of text/content
+            for x in 50..500 { img.put_pixel(x, y, image::Rgba([40, 40, 40, 255])); }
+        }
+        let f = write_png(img);
+        assert!(!is_blank_screenshot(&f.0));
+    }
+
+    #[test]
+    fn sparse_content_still_not_blank() {
+        // ~0.8% non-white (a small logo / single line of text) — must not be "blank".
+        let mut img = image::RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255]));
+        for y in 0..24 {
+            for x in 0..200 { img.put_pixel(x, y, image::Rgba([0, 0, 0, 255])); }
+        }
+        let f = write_png(img);
+        assert!(!is_blank_screenshot(&f.0), "ratio={}", screenshot_blank_ratio(&f.0));
+    }
+
+    #[test]
+    fn unreadable_path_is_blank() {
+        assert_eq!(screenshot_blank_ratio(Path::new("/nonexistent/x.png")), 1.0);
+        assert!(is_blank_screenshot(Path::new("/nonexistent/x.png")));
+    }
 }

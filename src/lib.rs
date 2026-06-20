@@ -258,7 +258,33 @@ fn browser_render(
     };
 
     // Pass 1: desktop screenshot.
-    let screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
+    let mut screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
+
+    // Blank-render retry (CARAPACE-09 / P1): when the captured desktop screenshot
+    // is visually blank (effectively all near-white), give slow CSS/font/animation
+    // paints a longer settle budget and capture once more. Keep whichever frame is
+    // non-blank. This is a same-UA retry — the mobile/Android UA ladder lives in the
+    // Python client and is driven by the render_blank signal we record below.
+    if screenshot_result.is_ok() && backend::is_blank_screenshot(&args.output) {
+        info!("desktop screenshot blank ({:.1}% white) — retrying with longer settle budget",
+              backend::screenshot_blank_ratio(&args.output) * 100.0);
+        let retry = backend::render_to_png_ex(&tmp_path, &args.output, args.width, args.height, render_ua, 9000);
+        if retry.is_ok() {
+            screenshot_result = retry;
+        }
+    }
+
+    // Record the final blank state so the caller can discard a white PNG that
+    // would otherwise pass a byte-size check, and so scoring treats the visual as
+    // unreliable. Measured on the delivered (pre-annotation) screenshot.
+    if screenshot_result.is_ok() && args.output.exists() {
+        let ratio = backend::screenshot_blank_ratio(&args.output);
+        report.blank_ratio = ratio;
+        report.render_blank = ratio >= backend::BLANK_WHITE_RATIO;
+        if report.render_blank {
+            info!("desktop screenshot still blank after retry ({:.1}% white)", ratio * 100.0);
+        }
+    }
 
     // Pass 2: post-JS DOM dump (CARAPACE-02 — dynamic overlay detection).
     // Only run when the screenshot succeeded: confirms Chromium is available and
