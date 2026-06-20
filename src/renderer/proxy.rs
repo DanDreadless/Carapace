@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 
@@ -34,8 +34,17 @@ use crate::fetcher::ssrf::is_safe_ip;
 
 /// Max upstream connections forwarded in one render session.
 const MAX_FORWARDED: u32 = 400;
-/// Per-connection read/write timeout.
-const CONN_TIMEOUT: Duration = Duration::from_secs(12);
+/// Upstream connect timeout — kept short so an unreachable/slow host fails fast,
+/// well inside Chromium's live-render budget (`--timeout=8000` = 8 s). A longer
+/// connect timeout let a single slow connection still be pending when Chromium
+/// captured, producing a degraded/blank live render (the transient flake fixed here).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read/write timeout on an established connection (tunnel / forward).
+const IO_TIMEOUT: Duration = Duration::from_secs(8);
+/// Total proxy lifetime budget. After this elapses a render is about to be
+/// captured, so a freshly-arriving connection is refused immediately rather than
+/// starting a connect that would only linger past the screenshot.
+const RENDER_BUDGET: Duration = Duration::from_secs(9);
 /// Max bytes copied per direction per connection — guards against a hostile
 /// same-origin server streaming forever to hang the render or exhaust memory.
 const MAX_BYTES_PER_DIR: u64 = 16 * 1024 * 1024;
@@ -104,6 +113,7 @@ impl PolicyProxy {
         let stop = Arc::new(AtomicBool::new(false));
         let forwarded = Arc::new(AtomicU32::new(0));
 
+        let started = Instant::now();
         let i2 = Arc::clone(&intercepted);
         let s2 = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -112,7 +122,14 @@ impl PolicyProxy {
                     break;
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((mut stream, _)) => {
+                        // Past the total render budget the screenshot is imminent —
+                        // refuse new connections immediately rather than starting a
+                        // connect that would linger past capture.
+                        if started.elapsed() > RENDER_BUDGET {
+                            refuse(&mut stream);
+                            continue;
+                        }
                         let pol = policy.clone();
                         let ic = Arc::clone(&i2);
                         let fc = Arc::clone(&forwarded);
@@ -194,9 +211,9 @@ fn safe_connect(host: &str, port: u16) -> ConnectOutcome {
         }
     }
     for a in &addrs {
-        if let Ok(s) = TcpStream::connect_timeout(a, CONN_TIMEOUT) {
-            s.set_read_timeout(Some(CONN_TIMEOUT)).ok();
-            s.set_write_timeout(Some(CONN_TIMEOUT)).ok();
+        if let Ok(s) = TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
+            s.set_read_timeout(Some(IO_TIMEOUT)).ok();
+            s.set_write_timeout(Some(IO_TIMEOUT)).ok();
             return ConnectOutcome::Ok(s);
         }
     }
@@ -209,8 +226,8 @@ fn handle_conn(
     intercepted: Arc<Mutex<Vec<String>>>,
     forwarded: Arc<AtomicU32>,
 ) {
-    client.set_read_timeout(Some(CONN_TIMEOUT)).ok();
-    client.set_write_timeout(Some(CONN_TIMEOUT)).ok();
+    client.set_read_timeout(Some(IO_TIMEOUT)).ok();
+    client.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
     let head = match read_request_head(&mut client) {
         Some(h) if !h.is_empty() => h,
