@@ -159,27 +159,48 @@ fn refuse(client: &mut TcpStream) {
     let _ = client.shutdown(Shutdown::Both);
 }
 
+/// Outcome of attempting to reach an upstream host.
+enum ConnectOutcome {
+    /// Connected — the stream to forward through.
+    Ok(TcpStream),
+    /// Rejected by SSRF (a resolved IP is internal, or DNS failed) — recorded as
+    /// evidence: a page pointing an allowed host at an internal IP is suspicious.
+    Ssrf,
+    /// Resolved to safe public IP(s) but could not connect (transient network /
+    /// upstream-down). NOT recorded — a same-origin/CDN request we *allowed* but
+    /// couldn't reach is a benign failure, not cross-origin exfil evidence.
+    Unreachable,
+}
+
 /// Resolve `host:port`, reject if **any** resolved IP is unsafe (strict
-/// DNS-rebinding defense), then connect to the first reachable safe address.
-fn safe_connect(host: &str, port: u16) -> Option<TcpStream> {
-    let addrs: Vec<_> = (host, port).to_socket_addrs().ok()?.collect();
+/// DNS-rebinding defense) or DNS fails, then connect to the first safe address.
+fn safe_connect(host: &str, port: u16) -> ConnectOutcome {
+    let addrs: Vec<_> = match (host, port).to_socket_addrs() {
+        Ok(a) => a.collect(),
+        // Unresolvable host: no IP, no connection possible — a benign network
+        // outcome, NOT an SSRF block. (An allowed same-origin host that simply
+        // doesn't resolve from the render container — e.g. metrics.roblox.com —
+        // must not be recorded as intercepted-exfil evidence.) Only a resolution
+        // to an internal IP below is SSRF.
+        Err(_) => return ConnectOutcome::Unreachable,
+    };
     if addrs.is_empty() {
-        return None;
+        return ConnectOutcome::Unreachable;
     }
     for a in &addrs {
         if is_safe_ip(&a.ip()).is_err() {
             debug!("policy proxy: SSRF-blocked {host} -> {}", a.ip());
-            return None;
+            return ConnectOutcome::Ssrf;
         }
     }
     for a in &addrs {
         if let Ok(s) = TcpStream::connect_timeout(a, CONN_TIMEOUT) {
             s.set_read_timeout(Some(CONN_TIMEOUT)).ok();
             s.set_write_timeout(Some(CONN_TIMEOUT)).ok();
-            return Some(s);
+            return ConnectOutcome::Ok(s);
         }
     }
-    None
+    ConnectOutcome::Unreachable
 }
 
 fn handle_conn(
@@ -216,7 +237,7 @@ fn handle_conn(
             return;
         }
         match safe_connect(&host, port) {
-            Some(upstream) => {
+            ConnectOutcome::Ok(upstream) => {
                 if client
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .is_ok()
@@ -224,10 +245,13 @@ fn handle_conn(
                     tunnel(client, upstream);
                 }
             }
-            None => {
-                record(&intercepted, format!("https://{} [ssrf-blocked]", host));
-                refuse(&mut client);
-            }
+            // The host was already allowed by policy (same-origin / vetted CDN), so a
+            // connect failure — whether SSRF (resolved to an internal IP) or simply
+            // unreachable — is NOT cross-origin exfil evidence and must not pollute
+            // the intercepted list. We still refuse the connection (the SSRF is
+            // blocked; security is unaffected — the protection is the block, not the
+            // record). Cross-origin requests are recorded at the policy-deny branch.
+            ConnectOutcome::Ssrf | ConnectOutcome::Unreachable => refuse(&mut client),
         }
     } else if let Some(rest) = target.strip_prefix("http://") {
         // Plain-HTTP absolute-form: GET http://host/path HTTP/1.1
@@ -245,7 +269,7 @@ fn handle_conn(
             return;
         }
         match safe_connect(&host, port) {
-            Some(mut upstream) => {
+            ConnectOutcome::Ok(mut upstream) => {
                 // Rewrite to origin-form and force Connection: close so each proxied
                 // request is its own connection (no keep-alive re-use to rewrite).
                 let rewritten = rewrite_http_head(&head, path);
@@ -253,10 +277,9 @@ fn handle_conn(
                     tunnel(client, upstream);
                 }
             }
-            None => {
-                record(&intercepted, target.to_string());
-                refuse(&mut client);
-            }
+            // Allowed host that failed to connect (SSRF or unreachable) — refuse but
+            // do not record; only policy-denied cross-origin requests are evidence.
+            ConnectOutcome::Ssrf | ConnectOutcome::Unreachable => refuse(&mut client),
         }
     } else {
         refuse(&mut client);
@@ -443,11 +466,11 @@ mod tests {
         // The SSRF gate must refuse hosts that resolve to internal IPs even if the
         // policy would otherwise allow them — this is the core protection when
         // scanning a malicious page that points an allowed host at an internal IP.
-        assert!(safe_connect("127.0.0.1", 80).is_none());        // loopback literal
-        assert!(safe_connect("localhost", 80).is_none());        // resolves to loopback
-        assert!(safe_connect("169.254.169.254", 80).is_none());  // cloud metadata
-        assert!(safe_connect("10.0.0.1", 80).is_none());         // RFC1918 private
-        assert!(safe_connect("192.168.1.1", 80).is_none());      // RFC1918 private
+        assert!(matches!(safe_connect("127.0.0.1", 80), ConnectOutcome::Ssrf));        // loopback literal
+        assert!(matches!(safe_connect("localhost", 80), ConnectOutcome::Ssrf));        // resolves to loopback
+        assert!(matches!(safe_connect("169.254.169.254", 80), ConnectOutcome::Ssrf));  // cloud metadata
+        assert!(matches!(safe_connect("10.0.0.1", 80), ConnectOutcome::Ssrf));         // RFC1918 private
+        assert!(matches!(safe_connect("192.168.1.1", 80), ConnectOutcome::Ssrf));      // RFC1918 private
     }
 
     #[test]

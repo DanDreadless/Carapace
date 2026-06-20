@@ -564,6 +564,39 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 continue;
             }
 
+            // Suppress loading-screen overlays — a full-viewport fixed layer whose
+            // background-image is a preloader/spinner/loader graphic is a page
+            // loading screen (shown while a JS framework renders), not a ClickFix /
+            // SocGholish takeover. A real attack overlay presents a fake CAPTCHA /
+            // browser-update prompt (HTML content or a screenshot-like image), never
+            // a bare spinner gif. The standalone overlay alone does not escalate the
+            // verdict; context collapse still fires if a clipboard/fake-CAPTCHA signal
+            // co-occurs. (CARAPACE: caixesp-finbk preloader.gif false positive)
+            let is_loading_screen = (lower.contains("background-image")
+                && (lower.contains("preloader")
+                    || lower.contains("loading.gif")
+                    || lower.contains("loader.gif")
+                    || lower.contains("loading.svg")
+                    || lower.contains("spinner")
+                    || lower.contains("ajax-loader")
+                    || lower.contains("/loading.")))
+                // A small fixed-pixel background-size (e.g. background-size:100px)
+                // means the overlay shows a small centered graphic (spinner/logo) on
+                // a solid colour — a loading screen. A real ClickFix/SocGholish
+                // takeover uses background-size:cover/100%/auto to fill the viewport
+                // with a fake prompt, never a 100px sprite. (caixesp preloader case —
+                // live render split the background-image into a separate CSS rule.)
+                || {
+                    static BG_SIZE_PX_RE: OnceLock<Regex> = OnceLock::new();
+                    let re = BG_SIZE_PX_RE.get_or_init(|| {
+                        Regex::new(r"background-size\s*:\s*\d{1,3}px").unwrap()
+                    });
+                    re.is_match(&lower)
+                };
+            if is_loading_screen {
+                continue;
+            }
+
             // Normalise whitespace for a readable evidence snippet
             let snippet: String = block
                 .split_whitespace()
