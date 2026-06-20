@@ -257,34 +257,61 @@ fn browser_render(
         backend::WINDOWS_UA
     };
 
-    // Pass 1: desktop screenshot.
-    let mut screenshot_result = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
+    // ── Pass 1: desktop screenshot — live-first with offline fallback (P0) ────
+    // Live render (CARAPACE-09 / P0): navigate the real URL through the same-origin
+    // policy proxy so the page loads its own content (the dominant cause of blank
+    // SPA renders). On failure or a blank frame, fall back to the offline
+    // self-contained `file://` render (which always works, fully isolated).
+    let live_enabled = std::env::var("CARAPACE_LIVE_RENDER")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(true);
+    let page_host = base_url.host_str().unwrap_or("").to_string();
 
-    // Blank-render retry (CARAPACE-09 / P1): when the captured desktop screenshot
-    // is visually blank (effectively all near-white), give slow CSS/font/animation
-    // paints a longer settle budget and capture once more. Keep whichever frame is
-    // non-blank. This is a same-UA retry — the mobile/Android UA ladder lives in the
-    // Python client and is driven by the render_blank signal we record below.
-    if screenshot_result.is_ok() && backend::is_blank_screenshot(&args.output) {
-        info!("desktop screenshot blank ({:.1}% white) — retrying with longer settle budget",
-              backend::screenshot_blank_ratio(&args.output) * 100.0);
-        let retry = backend::render_to_png_ex(&tmp_path, &args.output, args.width, args.height, render_ua, 9000);
-        if retry.is_ok() {
-            screenshot_result = retry;
+    let mut screenshot_result: crate::error::Result<Vec<String>> =
+        Err(crate::error::CarapaceError::Render("not rendered".into()));
+    let mut render_mode = "offline";
+
+    if live_enabled && !page_host.is_empty() {
+        match backend::render_to_png_live(
+            base_url.as_str(), &args.output, args.width, args.height, render_ua, &page_host, 0,
+        ) {
+            Ok(intercepted) => {
+                if backend::is_blank_screenshot(&args.output) {
+                    info!("live render blank ({:.1}% white) — falling back to offline render",
+                          backend::screenshot_blank_ratio(&args.output) * 100.0);
+                } else {
+                    screenshot_result = Ok(intercepted);
+                    render_mode = "live";
+                }
+            }
+            Err(e) => info!("live render failed ({}) — falling back to offline render", e),
         }
     }
 
-    // Record the final blank state so the caller can discard a white PNG that
-    // would otherwise pass a byte-size check, and so scoring treats the visual as
-    // unreliable. Measured on the delivered (pre-annotation) screenshot.
+    // Offline fallback (or primary when live is disabled): the proven self-contained
+    // `file://` render with all network refused. Includes the P1 longer-settle retry.
+    if screenshot_result.is_err() {
+        let mut offline = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
+        if offline.is_ok() && backend::is_blank_screenshot(&args.output) {
+            info!("offline screenshot blank — retrying with longer settle budget");
+            let retry = backend::render_to_png_ex(&tmp_path, &args.output, args.width, args.height, render_ua, 9000);
+            if retry.is_ok() {
+                offline = retry;
+            }
+        }
+        screenshot_result = offline;
+        render_mode = if live_enabled { "offline_fallback" } else { "offline" };
+    }
+
+    // Record the final blank state + which strategy produced the delivered image,
+    // so the caller can discard a white PNG and scoring/analysts see the truth.
     if screenshot_result.is_ok() && args.output.exists() {
         let ratio = backend::screenshot_blank_ratio(&args.output);
         report.blank_ratio = ratio;
         report.render_blank = ratio >= backend::BLANK_WHITE_RATIO;
-        if report.render_blank {
-            info!("desktop screenshot still blank after retry ({:.1}% white)", ratio * 100.0);
-        }
     }
+    report.render_mode = render_mode.to_string();
+    info!("screenshot render_mode={} blank={}", render_mode, report.render_blank);
 
     // Pass 2: post-JS DOM dump (CARAPACE-02 — dynamic overlay detection).
     // Only run when the screenshot succeeded: confirms Chromium is available and

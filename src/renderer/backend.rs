@@ -467,6 +467,99 @@ fn render_chromium(
     }
 }
 
+// ── Live-navigation render through the same-origin policy proxy (P0) ────────────
+
+/// Render the **live** page at `url` (navigated directly, not from `file://`)
+/// through the forwarding `PolicyProxy`, so same-origin content (CSS/JS/fonts/
+/// images and the page's own XHR/`fetch` API) actually loads and SPA/data-driven
+/// pages render real content.  Cross-origin requests are refused and recorded;
+/// every forwarded request is SSRF-validated at the proxy.  Returns the refused
+/// cross-origin URLs (the intercepted-request evidence).
+///
+/// `page_host` anchors the same-origin allow policy.  This path has no offline
+/// fallback of its own — the caller (`browser_render`) falls back to the offline
+/// self-contained render when this returns `Err` or a blank frame.
+pub fn render_to_png_live(
+    url: &str,
+    output_path: &Path,
+    width: u32,
+    height: u32,
+    ua: &str,
+    page_host: &str,
+    settle_ms: u32,
+) -> Result<Vec<String>> {
+    if !chromium_available() {
+        return Err(CarapaceError::Render("chromium not available for live render".into()));
+    }
+    use super::proxy::{PolicyProxy, RenderPolicy};
+
+    let full_page = height == 0;
+    let render_h = if full_page { FULL_PAGE_SENTINEL_H } else { height };
+    let vtb = if settle_ms == 0 { 5000 } else { settle_ms };
+
+    let screenshot_arg = format!("--screenshot={}", output_path.display());
+    let window_size = format!("--window-size={},{}", width, render_h);
+    let ua_arg = format!("--user-agent={}", ua);
+    let vtb_arg = format!("--virtual-time-budget={}", vtb);
+    let timeout_arg = format!("--timeout={}", vtb + 3000);
+
+    // Same-origin forwarding proxy. NO --proxy-bypass-list: every request — including
+    // the vetted CDNs — goes through the proxy so it is SSRF-checked (closes the
+    // direct-CDN-connect gap of the offline path).
+    let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
+    let proxy_arg = proxy.proxy_arg();
+
+    let mut cmd = Command::new(chromium_cmd());
+    cmd.args([
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--use-angle=swiftshader",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--no-first-run",
+        "--hide-scrollbars",
+        "--disable-blink-features=AutomationControlled",
+        &ua_arg,
+        &vtb_arg,
+        "--run-all-compositor-stages-before-draw",
+        // With an HTTP proxy and no bypass list, Chromium sends every request to the
+        // proxy by hostname (CONNECT host:443 / absolute-form GET) and the proxy
+        // resolves + SSRF-checks it — so all DNS goes through our safe resolver and
+        // DNS-rebinding is defeated, with no extra resolver flags needed.
+        &proxy_arg,
+        "--force-color-profile=srgb",
+        &timeout_arg,
+        &window_size,
+        &screenshot_arg,
+        url,
+    ]);
+
+    let out = cmd
+        .output()
+        .map_err(|e| CarapaceError::Render(format!("chromium live launch: {}", e)))?;
+
+    let intercepted = proxy.collect();
+
+    if output_path.exists() {
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        info!("chromium live screenshot saved ({} bytes)", size);
+        if full_page {
+            trim_bottom_whitespace(output_path);
+        }
+        Ok(intercepted)
+    } else {
+        Err(CarapaceError::Render(format!(
+            "chromium live exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" | ")
+        )))
+    }
+}
+
 // ── Blank-screenshot detection (CARAPACE-09 / P1) ──────────────────────────────
 
 /// A screenshot counts as visually blank when at least this fraction of its

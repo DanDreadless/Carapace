@@ -118,6 +118,14 @@ pub struct ThreatReport {
     #[serde(default)]
     pub blank_ratio: f32,
 
+    /// Which render strategy produced the delivered screenshot:
+    /// `"live"` (navigated the real URL through the same-origin policy proxy),
+    /// `"offline_fallback"` (live failed/blank → offline self-contained render),
+    /// or `"offline"` (live disabled). Surfaced for analyst visibility and tuning.
+    /// (CARAPACE-09 / P0)
+    #[serde(default)]
+    pub render_mode: String,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -136,6 +144,7 @@ impl ThreatReport {
             render_skipped: false,
             render_blank: false,
             blank_ratio: 0.0,
+            render_mode: String::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),
