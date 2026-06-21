@@ -92,6 +92,19 @@ pub enum Severity {
 
 // ── ThreatReport ──────────────────────────────────────────────────────────────
 
+/// One script after Tier-0 static deobfuscation (constant folding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedScript {
+    /// Logical name of the script, e.g. `inline[0]` or the external URL.
+    pub name: String,
+    /// SHA-256 (hex) of the ORIGINAL source — lets the consumer dedup/cache.
+    pub sha256: String,
+    /// Number of constant expressions folded.
+    pub fold_count: usize,
+    /// The folded source (capped for transport).
+    pub normalized: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ThreatReport {
     pub url: String,
@@ -134,6 +147,14 @@ pub struct ThreatReport {
     #[serde(default)]
     pub rendered_html: String,
 
+    /// Tier-0 deobfuscation output: per-script source with constants folded
+    /// (string concat, fromCharCode, atob-literal, literal-array index). Only
+    /// scripts that actually folded something are included. Lets the Python
+    /// engine run its signature library on the resolved payload rather than the
+    /// obfuscated original. (Large-JS deobfuscation — Phase 1 / Tier-0)
+    #[serde(default)]
+    pub normalized_scripts: Vec<NormalizedScript>,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -154,6 +175,7 @@ impl ThreatReport {
             blank_ratio: 0.0,
             render_mode: String::new(),
             rendered_html: String::new(),
+            normalized_scripts: Vec::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),
@@ -353,6 +375,15 @@ impl ThreatReport {
 
     pub fn add_blocked_network(&mut self, url: String) {
         self.blocked_network.push(url);
+    }
+
+    /// Record a Tier-0 deobfuscation result. Bounded so a page full of scripts
+    /// cannot bloat the transported report.
+    pub fn add_normalized_script(&mut self, script: NormalizedScript) {
+        const MAX_NORMALIZED_SCRIPTS: usize = 25;
+        if self.normalized_scripts.len() < MAX_NORMALIZED_SCRIPTS {
+            self.normalized_scripts.push(script);
+        }
     }
 
     /// Record a fullscreen CSS overlay — the structural signature of ClickFix

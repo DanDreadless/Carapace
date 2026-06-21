@@ -400,6 +400,9 @@ pub async fn analyse(
                     let chunk = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                     let mut chunk_report = crate::threat::ThreatReport::new(&source_label);
                     crate::js::analysis::analyse(&chunk, &source_label, &mut chunk_report);
+                    // Tier-0 deobfuscation per chunk; folded-payload flags
+                    // propagate via merge_flags. (Large-JS deobfuscation — Phase 1)
+                    crate::js::deobfuscate_and_reanalyse(&source_label, &chunk, &mut chunk_report);
                     report.merge_flags(chunk_report);
                     if end >= bytes.len() {
                         break;
@@ -408,6 +411,9 @@ pub async fn analyse(
                 }
             } else {
                 crate::js::analysis::analyse(&source, &source_label, &mut report);
+                // Tier-0 static deobfuscation: fold constants and re-analyse the
+                // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
+                crate::js::deobfuscate_and_reanalyse(&source_label, &source, &mut report);
             }
 
             report

@@ -1,14 +1,56 @@
 pub mod analysis;
+pub mod deobfuscate;
 pub mod runtime;
 pub mod vdom;
 
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::error::Result;
 use crate::html::{Framework, ProcessedHtml};
-use crate::threat::ThreatReport;
+use crate::threat::{NormalizedScript, ThreatReport};
 use runtime::SandboxLimits;
 use vdom::DomSnapshot;
+
+/// Per-script cap on the folded source we transport back to the caller.
+const MAX_NORMALIZED_BYTES: usize = 256 * 1024;
+
+fn sha256_hex(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Tier-0 deobfuscation for one script: fold constants, and when anything
+/// folded, (1) re-run static analysis on the resolved source so Carapace's AST
+/// checks see the payload, and (2) record the artifact for the Python engine.
+/// Used by both the render pipeline (`process`) and the `/analyse` endpoint.
+pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatReport) {
+    let result = deobfuscate::normalize(source);
+    if result.fold_count == 0 {
+        return;
+    }
+    info!(
+        "deobf: {} folded {} constant(s) in {} round(s) ({} -> {} bytes)",
+        name,
+        result.fold_count,
+        result.iterations,
+        source.len(),
+        result.normalized.len(),
+    );
+    analysis::analyse(&result.normalized, &format!("{name}+deobf"), report);
+
+    let mut normalized = result.normalized;
+    if normalized.len() > MAX_NORMALIZED_BYTES {
+        normalized.truncate(MAX_NORMALIZED_BYTES);
+    }
+    report.add_normalized_script(NormalizedScript {
+        name: name.to_string(),
+        sha256: sha256_hex(source),
+        fold_count: result.fold_count,
+        normalized,
+    });
+}
 
 /// Output of the JS processing stage.
 pub struct JsOutput {
@@ -50,7 +92,11 @@ impl JsProcessor {
         );
 
         for (i, script) in page.scripts.inline_scripts.iter().enumerate() {
-            analysis::analyse(script, &format!("inline[{}]", i), report);
+            let name = format!("inline[{}]", i);
+            analysis::analyse(script, &name, report);
+            // Tier-0 static deobfuscation: fold constants and re-analyse the
+            // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
+            deobfuscate_and_reanalyse(&name, script, report);
         }
 
         // External scripts: analysis of their source requires fetching.
