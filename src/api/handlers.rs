@@ -411,12 +411,9 @@ pub async fn analyse(
                 }
             } else {
                 crate::js::analysis::analyse(&source, &source_label, &mut report);
-                // Tier-0 static deobfuscation: fold constants and re-analyse the
-                // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
-                crate::js::deobfuscate_and_reanalyse(&source_label, &source, &mut report);
-                // Tier-2 dynamic deobfuscation: sink-capture sandbox.
-                // (Large-JS deobfuscation — Phase 2)
-                crate::js::deep_deobfuscate(&source_label, &source, &mut report);
+                // Full deobfuscation ladder: Tier-0 fold + Tier-2 sandbox capture +
+                // Tier-3 unresolved-obfuscation detect-only. (Large-JS deobf P1/P2/P4)
+                crate::js::deobfuscate_pipeline(&source_label, &source, &mut report);
             }
 
             report

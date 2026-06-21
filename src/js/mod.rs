@@ -33,10 +33,10 @@ fn sha256_hex(s: &str) -> String {
 /// folded, (1) re-run static analysis on the resolved source so Carapace's AST
 /// checks see the payload, and (2) record the artifact for the Python engine.
 /// Used by both the render pipeline (`process`) and the `/analyse` endpoint.
-pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatReport) {
+pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatReport) -> usize {
     let result = deobfuscate::normalize(source);
     if result.fold_count == 0 {
-        return;
+        return 0;
     }
     info!(
         "deobf: {} folded {} constant(s) in {} round(s) ({} -> {} bytes)",
@@ -52,12 +52,14 @@ pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatRe
     if normalized.len() > MAX_NORMALIZED_BYTES {
         normalized.truncate(MAX_NORMALIZED_BYTES);
     }
+    let folds = result.fold_count;
     report.add_normalized_script(NormalizedScript {
         name: name.to_string(),
         sha256: sha256_hex(source),
-        fold_count: result.fold_count,
+        fold_count: folds,
         normalized,
     });
+    folds
 }
 
 /// Tier-2 dynamic deobfuscation for one script: when obfuscation markers are
@@ -65,9 +67,9 @@ pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatRe
 /// recovered payload (so AST checks see the cleartext) and record it as a
 /// `decoded_payloads` artifact. Gated on markers + size so clean/huge scripts are
 /// skipped. Executes the script in a capability-free, time/memory-capped sandbox.
-pub fn deep_deobfuscate(name: &str, source: &str, report: &mut ThreatReport) {
+pub fn deep_deobfuscate(name: &str, source: &str, report: &mut ThreatReport) -> usize {
     if source.len() > DEEP_DEOBF_MAX_INPUT || !deobfuscate::looks_obfuscated(source) {
-        return;
+        return 0;
     }
     let limits = SandboxLimits {
         max_memory: 64 * 1024 * 1024,
@@ -77,9 +79,10 @@ pub fn deep_deobfuscate(name: &str, source: &str, report: &mut ThreatReport) {
     let deadline = Instant::now() + DEEP_DEOBF_BUDGET;
     let payloads = deobfuscate::deobfuscate_deep(source, &limits, deadline);
     if payloads.is_empty() {
-        return;
+        return 0;
     }
-    info!("deobf: {} recovered {} dynamic payload(s)", name, payloads.len());
+    let count = payloads.len();
+    info!("deobf: {} recovered {} dynamic payload(s)", name, count);
     for p in payloads {
         analysis::analyse(&p.code, &format!("{name}+deob[{}:L{}]", p.sink, p.layer), report);
         let mut code = p.code;
@@ -92,6 +95,28 @@ pub fn deep_deobfuscate(name: &str, source: &str, report: &mut ThreatReport) {
             layer: p.layer,
             code,
         });
+    }
+    count
+}
+
+/// Full deobfuscation ladder for one script: Tier-0 (static fold) + Tier-2
+/// (sandbox sink-capture) + Tier-3 (detect-only). When a recognised obfuscator is
+/// present but neither tier recovered anything, the obfuscation itself is flagged
+/// as unresolved — obfuscation that resists analysis is a signal. (Phase 4)
+pub fn deobfuscate_pipeline(name: &str, source: &str, report: &mut ThreatReport) {
+    let folds = deobfuscate_and_reanalyse(name, source, report);
+    let payloads = deep_deobfuscate(name, source, report);
+    if folds == 0 && payloads == 0 {
+        if let Some(family) = deobfuscate::obfuscation_family(source) {
+            info!("deobf: {} unresolved obfuscation ({})", name, family);
+            report.add_js_flag(crate::threat::JsFlag::UnresolvedObfuscation {
+                family: family.to_string(),
+                detail: format!(
+                    "{family} obfuscation detected, but neither static constant-folding nor \
+                     sandbox execution recovered a payload — the script resists analysis"
+                ),
+            });
+        }
     }
 }
 
@@ -137,13 +162,10 @@ impl JsProcessor {
         for (i, script) in page.scripts.inline_scripts.iter().enumerate() {
             let name = format!("inline[{}]", i);
             analysis::analyse(script, &name, report);
-            // Tier-0 static deobfuscation: fold constants and re-analyse the
-            // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
-            deobfuscate_and_reanalyse(&name, script, report);
-            // Tier-2 dynamic deobfuscation: sink-capture sandbox for obfuscated
-            // scripts (decouples deobfuscation from framework detection).
-            // (Large-JS deobfuscation — Phase 2)
-            deep_deobfuscate(&name, script, report);
+            // Full deobfuscation ladder: Tier-0 static fold (Phase 1) + Tier-2
+            // sandbox sink-capture (Phase 2) + Tier-3 unresolved-obfuscation
+            // detect-only (Phase 4). Decoupled from framework detection.
+            deobfuscate_pipeline(&name, script, report);
         }
 
         // External scripts: analysis of their source requires fetching.

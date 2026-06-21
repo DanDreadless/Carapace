@@ -454,6 +454,25 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             }
         }
 
+        // Crypto-wallet RPC method strings — the core action of a Web3 wallet
+        // drainer. These exact strings have no benign use outside wallet/dApp
+        // interaction, so they are a strong signal once they surface (especially
+        // in deobfuscated code re-analysed after Tier-0/Tier-2). (Phase 4)
+        const WALLET_RPC_METHODS: &[&str] = &[
+            "eth_sendTransaction",
+            "eth_signTypedData",
+            "eth_signTypedData_v4",
+            "eth_sign",
+            "personal_sign",
+            "wallet_requestPermissions",
+        ];
+        for &m in WALLET_RPC_METHODS {
+            if val == m {
+                self.report.add_js_flag(JsFlag::CryptoWalletApi { method: m.to_string() });
+                break;
+            }
+        }
+
         // StringLiteral has no children — no walk needed.
     }
 }
@@ -662,5 +681,19 @@ mod tests {
         assert!(report.js_flags().iter().any(|f| matches!(
             f, JsFlag::ClipboardWrite { method, .. } if method == "document.execCommand(copy)"
         )));
+    }
+
+    #[test]
+    fn detects_wallet_rpc_method_string() {
+        let report = run(r#"provider.request({ method: "eth_sendTransaction", params: [tx] })"#);
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::CryptoWalletApi { method } if method == "eth_sendTransaction"
+        )));
+    }
+
+    #[test]
+    fn benign_string_not_flagged_as_wallet_api() {
+        let report = run(r#"var x = "send_transaction_to_server";"#);
+        assert!(!report.js_flags().iter().any(|f| matches!(f, JsFlag::CryptoWalletApi { .. })));
     }
 }

@@ -329,6 +329,41 @@ pub fn deobfuscate_deep(source: &str, limits: &SandboxLimits, deadline: Instant)
     out
 }
 
+/// Identify the obfuscation family of a script, FP-safely. Returns the family
+/// name only for **recognised obfuscators** whose markers do not occur in normal
+/// minified code (minifiers use short alphanumeric names, not `_0x` prefixes,
+/// JSFuck character sets, or packer signatures). Used by Tier-3 to flag
+/// obfuscation that resisted both static folding and sandbox execution.
+pub fn obfuscation_family(source: &str) -> Option<&'static str> {
+    if source.len() < 40 {
+        return None;
+    }
+    // obfuscator.io: hex-prefixed identifiers (_0xabcd) used pervasively. Normal
+    // minifiers never emit this prefix, so even a handful is conclusive.
+    let hex_ids = source.match_indices("_0x").count();
+    if hex_ids > 5 {
+        return Some("obfuscator.io string-array");
+    }
+    // Dean Edwards / generic packer signature.
+    if source.contains("eval(function(p,a,c,k,e,") {
+        return Some("packer (eval p,a,c,k,e,d)");
+    }
+    // JSFuck: source is (almost) entirely []()!+ characters.
+    let non_ws: usize = source.chars().filter(|c| !c.is_whitespace()).count();
+    if non_ws > 50 {
+        let jsfuck: usize = source.chars().filter(|c| matches!(c, '[' | ']' | '(' | ')' | '!' | '+')).count();
+        if jsfuck * 100 / non_ws.max(1) > 90 {
+            return Some("JSFuck");
+        }
+    }
+    // Dense hex/unicode escape obfuscation (not ordinary minification).
+    let esc = source.matches("\\x").count() + source.matches("\\u").count();
+    if esc > 40 && (esc * 4) * 100 / source.len() > 25 {
+        return Some("dense hex/unicode escape");
+    }
+    None
+}
+
 /// Stable FNV-1a hash for payload dedup.
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -476,5 +511,27 @@ mod deep_tests {
         assert!(looks_obfuscated(r#"eval(atob("x"))"#));
         assert!(looks_obfuscated("String.fromCharCode(104,105)"));
         assert!(!looks_obfuscated("function add(a,b){return a+b;}"));
+    }
+
+    #[test]
+    fn obfuscation_family_detects_obfuscator_io() {
+        let src = "var _0x1a2b=['a','b'];function _0x3c4d(_0x5e,_0x6f){return _0x1a2b[_0x5e];}\
+                   var _0x7a=_0x3c4d(0);var _0x8b=_0x3c4d(1);var _0x9c=_0x3c4d(0);";
+        assert_eq!(obfuscation_family(src), Some("obfuscator.io string-array"));
+    }
+
+    #[test]
+    fn obfuscation_family_detects_packer() {
+        assert_eq!(
+            obfuscation_family("eval(function(p,a,c,k,e,d){return p}('x',1,1,'a'.split(',')))"),
+            Some("packer (eval p,a,c,k,e,d)"),
+        );
+    }
+
+    #[test]
+    fn obfuscation_family_ignores_clean_minified() {
+        // Normal minified code uses short alphanumeric names, not _0x / JSFuck.
+        let src = "function a(b,c){return b+c}var d=a(1,2),e=a(3,4);console.log(d,e);";
+        assert_eq!(obfuscation_family(src), None);
     }
 }

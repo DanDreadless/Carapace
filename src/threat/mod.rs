@@ -72,6 +72,15 @@ pub enum JsFlag {
     /// event handler with `clipboardData.setData`.
     /// `method` is one of `"navigator.clipboard.writeText"` or `"copy_event"`.
     ClipboardWrite { method: String, payload: String },
+    /// Tier-3: the script is heavily obfuscated by a recognised obfuscator but
+    /// neither static folding nor sandbox execution recovered a payload — the
+    /// obfuscation itself resists analysis. `family` names the obfuscator.
+    /// (Large-JS deobfuscation — Phase 4)
+    UnresolvedObfuscation { family: String, detail: String },
+    /// A crypto-wallet RPC method string (`eth_sendTransaction`, `personal_sign`,
+    /// …) appears in the script — the core action of a Web3 wallet drainer. Strong
+    /// signal once it surfaces in deobfuscated code. (Large-JS deobfuscation — Phase 4)
+    CryptoWalletApi { method: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +396,13 @@ impl ThreatReport {
                 };
                 let snippet = &payload[..payload.len().min(200)];
                 self.push_flag(severity, code, format!("{} → {:?}", method, snippet));
+            }
+            JsFlag::UnresolvedObfuscation { detail, .. } => {
+                self.push_flag(Severity::Medium, "OBFUSCATION_UNRESOLVED", detail.clone());
+            }
+            JsFlag::CryptoWalletApi { method } => {
+                self.push_flag(Severity::High, "CRYPTO_WALLET_API",
+                    format!("wallet RPC method: {}", method));
             }
             _ => {}
         }
