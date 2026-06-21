@@ -560,6 +560,64 @@ pub fn render_to_png_live(
     }
 }
 
+/// Dump the post-JS DOM of the **live** page at `url`, navigated through the
+/// same-origin + IPFS-gateway policy proxy. Unlike `dump_dom` (which renders the
+/// offline `file://` self-contained shell with all network blocked), this lets the
+/// page's service worker / SPA framework fetch its real content — so the returned
+/// DOM is what a real browser actually renders (e.g. the true content behind an
+/// IPFS service-worker gateway). Returns "" if Chromium is unavailable or fails.
+pub fn dump_dom_live(url: &str, ua: &str, page_host: &str, settle_ms: u32) -> String {
+    if !chromium_available() {
+        return String::new();
+    }
+    use super::proxy::{PolicyProxy, RenderPolicy};
+
+    let ua_arg = format!("--user-agent={}", ua);
+    let vtb = if settle_ms == 0 { 5000 } else { settle_ms };
+    let vtb_arg = format!("--virtual-time-budget={}", vtb);
+    let timeout_arg = format!("--timeout={}", vtb + 3000);
+
+    let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
+    let proxy_arg = proxy.proxy_arg();
+
+    let result = Command::new(chromium_cmd())
+        .args([
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--use-angle=swiftshader",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-sync",
+            "--no-first-run",
+            "--disable-blink-features=AutomationControlled",
+            &ua_arg,
+            &vtb_arg,
+            "--run-all-compositor-stages-before-draw",
+            &timeout_arg,
+            &proxy_arg,
+            "--dump-dom",
+            url,
+        ])
+        .output();
+
+    let _ = proxy.collect();
+
+    match result {
+        Ok(out) => {
+            let dom = String::from_utf8_lossy(&out.stdout).into_owned();
+            info!("dump-dom-live: {} bytes", dom.len());
+            dom
+        }
+        Err(e) => {
+            warn!("dump-dom-live failed: {}", e);
+            String::new()
+        }
+    }
+}
+
 // ── Blank-screenshot detection (CARAPACE-09 / P1) ──────────────────────────────
 
 /// A screenshot counts as visually blank when at least this fraction of its

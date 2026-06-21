@@ -316,10 +316,28 @@ fn browser_render(
     // Pass 2: post-JS DOM dump (CARAPACE-02 — dynamic overlay detection).
     // Only run when the screenshot succeeded: confirms Chromium is available and
     // the page rendered.  The temp file must stay alive until all passes complete.
-    let dumped_dom = if screenshot_result.is_ok() {
-        backend::dump_dom(&tmp_path, render_ua)
-    } else {
+    //
+    // When the live render succeeded, dump the DOM of the LIVE page (through the
+    // same-origin + IPFS-gateway policy proxy) so we capture what the browser
+    // actually rendered — including content a service-worker gateway (IPFS dweb.link)
+    // or SPA assembles at runtime, which the HTTP fetcher only sees as a bootstrap
+    // shell. The result is exposed as report.rendered_html so the caller can run the
+    // full HTML/JS analysers on the real content. Falls back to the offline file://
+    // dump otherwise.
+    let dumped_dom = if !screenshot_result.is_ok() {
         String::new()
+    } else if render_mode == "live" && !page_host.is_empty() {
+        let live_dom = backend::dump_dom_live(base_url.as_str(), render_ua, &page_host, 0);
+        if !live_dom.is_empty() {
+            // Cap the transported DOM (the analysers only need title/CSS/forms/scripts).
+            const MAX_RENDERED_HTML: usize = 3 * 1024 * 1024;
+            report.rendered_html = live_dom.chars().take(MAX_RENDERED_HTML).collect();
+            live_dom
+        } else {
+            backend::dump_dom(&tmp_path, render_ua)
+        }
+    } else {
+        backend::dump_dom(&tmp_path, render_ua)
     };
 
     // Pass 3: mobile viewport screenshot (CARAPACE-05).

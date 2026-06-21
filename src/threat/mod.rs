@@ -126,6 +126,14 @@ pub struct ThreatReport {
     #[serde(default)]
     pub render_mode: String,
 
+    /// The post-JS DOM of the live render (when live mode succeeded), capped for
+    /// transport. Lets the caller run the full HTML/JS analysers on what the browser
+    /// actually rendered — essential for content hidden behind a service-worker
+    /// gateway (IPFS dweb.link) or fully JS-rendered SPAs, which the HTTP fetcher
+    /// only sees as a bootstrap shell. Empty when not available. (CARAPACE-09 / P0-c)
+    #[serde(default)]
+    pub rendered_html: String,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -145,6 +153,7 @@ impl ThreatReport {
             render_blank: false,
             blank_ratio: 0.0,
             render_mode: String::new(),
+            rendered_html: String::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),

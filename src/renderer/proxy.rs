@@ -49,6 +49,21 @@ const RENDER_BUDGET: Duration = Duration::from_secs(9);
 /// same-origin server streaming forever to hang the render or exhaust memory.
 const MAX_BYTES_PER_DIR: u64 = 16 * 1024 * 1024;
 
+/// Public IPFS gateways / trustless block providers. Content served from these is
+/// **content-addressed** (every block is hash-verified against its CID by the
+/// fetching code), so allowing read-only block retrieval is safe: a gateway cannot
+/// substitute arbitrary content for a given CID. Modern IPFS gateways (dweb.link,
+/// ipfs.io, …) ship a service-worker bootstrap shell that assembles the real page
+/// by fetching blocks from these hosts; without allowing them the SW renders blank
+/// and the page's true content is invisible to analysis. SSRF-checked per request
+/// like everything else.
+const IPFS_GATEWAY_HOSTS: &[&str] = &[
+    "dweb.link", "ipfs.io", "trustless-gateway.link", "inbrowser.link",
+    "w3s.link", "nftstorage.link", "4everland.io", "cf-ipfs.com",
+    "ipfs.runfission.com", "gateway.pinata.cloud", "flk-ipfs.xyz",
+    "storry.tv", "ipfs.eth.aragon.network", "hardbin.com",
+];
+
 /// Network policy for a render, anchored on the scanned page's host.
 #[derive(Clone)]
 pub struct RenderPolicy {
@@ -90,9 +105,20 @@ impl RenderPolicy {
             .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
     }
 
-    /// A host may be reached live when it is same-site or a vetted CDN.
+    /// Content-addressed IPFS gateway / trustless block provider (read-only,
+    /// hash-verified blocks — safe to allow so a page's service worker can
+    /// assemble its real content).
+    pub fn is_ipfs_gateway(&self, host: &str) -> bool {
+        let h = host.to_ascii_lowercase();
+        IPFS_GATEWAY_HOSTS
+            .iter()
+            .any(|g| h == *g || h.ends_with(&format!(".{}", g)))
+    }
+
+    /// A host may be reached live when it is same-site, a vetted CDN, or a
+    /// content-addressed IPFS gateway.
     pub fn allows(&self, host: &str) -> bool {
-        self.is_same_site(host) || self.is_known_good(host)
+        self.is_same_site(host) || self.is_known_good(host) || self.is_ipfs_gateway(host)
     }
 }
 
@@ -450,6 +476,19 @@ mod tests {
         assert!(!p.allows("evil-c2.com"));
         assert!(!p.allows("example.com.attacker.net")); // suffix-trick must NOT match
         assert!(!p.allows("notexample.com"));
+    }
+
+    #[test]
+    fn ipfs_gateways_allowed_for_block_fetch() {
+        // A page on an IPFS SW gateway: its service worker must reach content-addressed
+        // block providers to assemble the real content.
+        let p = policy("bafyfoo.ipfs.dweb.link");
+        assert!(p.allows("trustless-gateway.link"));
+        assert!(p.allows("bafyfoo.ipfs.inbrowser.link"));
+        assert!(p.allows("ipfs.io"));
+        assert!(p.allows("gateway.pinata.cloud"));
+        // still refuse a non-IPFS third party
+        assert!(!p.allows("evil-c2.com"));
     }
 
     #[test]
