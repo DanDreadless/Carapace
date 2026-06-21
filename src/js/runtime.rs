@@ -110,6 +110,11 @@ pub fn run_sandbox(
     let rt = Runtime::new().map_err(|e| CarapaceError::JsRuntime(e.to_string()))?;
     rt.set_memory_limit(limits.max_memory);
     rt.set_max_stack_size(512 * 1024); // 512 KB stack
+    // Abort runaway loops in a single script block at the deadline — without this
+    // a `while(1){}` would hang the worker (the per-block budget check only runs
+    // between blocks, not during one).
+    let interrupt_deadline = Instant::now() + limits.max_duration;
+    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= interrupt_deadline)));
 
     let ctx = Context::full(&rt).map_err(|e| CarapaceError::JsRuntime(e.to_string()))?;
 
@@ -205,6 +210,131 @@ pub fn run_sandbox(
         network_attempts,
         clipboard_writes,
     })
+}
+
+// ── Deobfuscation sink-capture sandbox (Tier-2) ─────────────────────────────────
+
+/// Installed before the analysed script. Neuters the dynamic-code and decode
+/// sinks so that, instead of *executing* a deobfuscated payload, the sandbox
+/// *captures* it. The obfuscated script's own decoder still runs (in the
+/// capability-free sandbox) and assembles the cleartext — we intercept it at the
+/// final sink (`eval`, `Function`, `document.write`, `setTimeout(string)`) and at
+/// the common decode primitives (`atob`/`unescape`/`decodeURIComponent`).
+///
+/// Captures accumulate in `globalThis.__cap__` as `"<sink> <payload>"`.
+/// `atob`/`unescape`/`decodeURIComponent` still RETURN the real decoded value so
+/// layered decoders keep working; `eval`/`Function` do NOT execute the payload.
+const DEOBF_PREAMBLE: &str = r#"(function(){
+  var C = (globalThis.__cap__ = []);
+  function rec(sink, v){ try{ if(typeof v==='string' && v.length>0 && v.length<4000000) C.push(sink+' '+v); }catch(e){} }
+  try{ globalThis.eval = function(c){ rec('eval', c); return undefined; }; }catch(e){}
+  try{
+    var _F = globalThis.Function;
+    var NF = function(){ var a=arguments; var b=a.length?a[a.length-1]:''; rec('Function', b); return function(){}; };
+    try{ NF.prototype = _F.prototype; }catch(e){}
+    globalThis.Function = NF;
+  }catch(e){}
+  try{ var _a=globalThis.atob; globalThis.atob=function(s){ var r=''; try{r=_a?_a(s):''}catch(e){} rec('atob', r); return r; }; }catch(e){}
+  try{ var _u=globalThis.unescape; globalThis.unescape=function(s){ var r=s; try{r=_u?_u(s):s}catch(e){} rec('unescape', r); return r; }; }catch(e){}
+  try{ var _d=globalThis.decodeURIComponent; globalThis.decodeURIComponent=function(s){ var r=s; try{r=_d(s)}catch(e){} rec('decodeURIComponent', r); return r; }; }catch(e){}
+  try{ if(globalThis.document){ globalThis.document.write=function(h){ rec('document.write', h); }; globalThis.document.writeln=function(h){ rec('document.write', h); }; } }catch(e){}
+  try{ globalThis.setTimeout=function(f){ if(typeof f==='string') rec('setTimeout', f); return 0; }; }catch(e){}
+  try{ globalThis.setInterval=function(f){ if(typeof f==='string') rec('setInterval', f); return 0; }; }catch(e){}
+})();"#;
+
+const DEOBF_TEARDOWN: &str = r#"(function(){ try{ return JSON.stringify(globalThis.__cap__||[]); }catch(e){ return "[]"; } })()"#;
+
+/// One sink-capture pass over a single script. Captured payloads are the strings
+/// the script tried to `eval`/`Function`/`document.write`/`setTimeout` or decode.
+#[derive(Debug, Default)]
+pub struct DeobResult {
+    /// `(sink, payload)` pairs, e.g. `("eval", "fetch('https://c2')")`.
+    pub captured: Vec<(String, String)>,
+}
+
+/// Execute `script` in a capability-free QuickJS sandbox with the dynamic-code
+/// sinks neutered to *capture* rather than execute. Network, filesystem, process
+/// and timers are all absent/blocked; memory, stack and wall-clock are capped and
+/// an interrupt handler aborts runaway loops at the deadline. Never returns an
+/// error — capture is best-effort.
+pub fn run_deobfuscation_sandbox(script: &str, limits: &SandboxLimits) -> DeobResult {
+    let rt = match Runtime::new() {
+        Ok(r) => r,
+        Err(e) => { warn!("deobf-sandbox: runtime init failed: {}", e); return DeobResult::default(); }
+    };
+    rt.set_memory_limit(limits.max_memory);
+    rt.set_max_stack_size(512 * 1024);
+
+    // Hard stop for infinite loops in hostile code — without this a `while(1){}`
+    // in a sample would hang the worker. The handler returns true once the
+    // deadline passes, raising an uncatchable exception inside the interpreter.
+    let deadline = Instant::now() + limits.max_duration;
+    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+
+    let ctx = match Context::full(&rt) {
+        Ok(c) => c,
+        Err(e) => { warn!("deobf-sandbox: context init failed: {}", e); return DeobResult::default(); }
+    };
+
+    // Reuse the standard capability-free environment, then add a native global
+    // `atob` so the preamble can wrap a real base64 decoder.
+    let vdom = new_shared_vdom();
+    let throwaway: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cw: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let _ = ctx.with(|ctx| -> std::result::Result<(), rquickjs::Error> {
+        let g = ctx.globals();
+        setup_console(&ctx, &g, Arc::clone(&throwaway))?;
+        setup_document(&ctx, &g, Arc::clone(&vdom), Arc::clone(&cw))?;
+        setup_window(&ctx, &g, "https://analysis.local/", Arc::clone(&throwaway), Arc::clone(&cw))?;
+        setup_blocked_network(&ctx, &g, Arc::clone(&throwaway), Arc::clone(&throwaway))?;
+        setup_storage(&ctx, &g)?;
+        setup_misc(&ctx, &g)?;
+        let atob = Function::new(ctx.clone(), |s: String| -> String {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default()
+        })?;
+        g.set("atob", atob)?;
+        Ok(())
+    });
+
+    // Eval in NON-strict mode: rquickjs defaults to strict, where
+    // `(function(){return this;})()` yields undefined. Non-strict + global scope
+    // makes that idiom return the real global so the hooks bind correctly, and is
+    // also more compatible with the sloppy-mode code obfuscators tend to emit.
+    fn eval_loose(ctx: &Ctx, src: &str) {
+        let mut opts = rquickjs::context::EvalOptions::default();
+        opts.strict = false;
+        let _ = ctx.eval_with_options::<(), _>(src, opts);
+    }
+
+    // The sandbox setup binds `globalThis` to the window stub; rebind it to the
+    // REAL global object so the preamble's `globalThis.eval = ...` overrides the
+    // binding that bare `eval(...)` calls actually resolve against.
+    ctx.with(|ctx| eval_loose(&ctx,
+        "(function(){var g=(function(){return this;})();if(g){g.globalThis=g;}})();"));
+    // Install the capture hooks, then run the (potentially hostile) script.
+    ctx.with(|ctx| eval_loose(&ctx, DEOBF_PREAMBLE));
+    ctx.with(|ctx| eval_loose(&ctx, script));
+
+    let json = ctx.with(|ctx| {
+        let mut opts = rquickjs::context::EvalOptions::default();
+        opts.strict = false;
+        ctx.eval_with_options::<String, _>(DEOBF_TEARDOWN, opts)
+            .unwrap_or_else(|_| "[]".to_string())
+    });
+    let mut captured = Vec::new();
+    if let Ok(items) = serde_json::from_str::<Vec<String>>(&json) {
+        for item in items {
+            if let Some((sink, payload)) = item.split_once(' ') {
+                captured.push((sink.to_string(), payload.to_string()));
+            }
+        }
+    }
+    DeobResult { captured }
 }
 
 // ── Global setup functions ────────────────────────────────────────────────────
@@ -603,4 +733,71 @@ fn extract_origin(url: &str) -> String {
             Some(format!("{scheme}://{host}{port}"))
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod deobf_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn capture(script: &str) -> Vec<(String, String)> {
+        let limits = SandboxLimits {
+            max_memory: 64 * 1024 * 1024,
+            max_duration: Duration::from_secs(3),
+            max_scripts: 20,
+        };
+        run_deobfuscation_sandbox(script, &limits).captured
+    }
+
+    fn has(caps: &[(String, String)], sink: &str, needle: &str) -> bool {
+        caps.iter().any(|(s, p)| s == sink && p.contains(needle))
+    }
+
+    #[test]
+    fn captures_eval_of_atob() {
+        // atob("ZmV0Y2goJ2h0dHBzOi8vYzInKQ==") -> fetch('https://c2')
+        let caps = capture(r#"eval(atob("ZmV0Y2goJ2h0dHBzOi8vYzInKQ=="));"#);
+        assert!(has(&caps, "eval", "fetch('https://c2')"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn captures_function_constructor_body() {
+        let caps = capture(r#"new Function("return fetch('https://c2/x')")();"#);
+        assert!(has(&caps, "Function", "fetch('https://c2/x')"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn captures_document_write_unescape() {
+        let caps = capture(r#"document.write(unescape("%3Cscript%3Ealert(1)%3C/script%3E"));"#);
+        assert!(has(&caps, "document.write", "<script>"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn cracks_string_array_decoder() {
+        // Minimal obfuscator.io-style: a string-array + decoder, eval'd.
+        // atob('ZmV0Y2g=')='fetch'  -> eval("fetch('x')")
+        let caps = capture(
+            r#"var a=['ZmV0Y2g='];function d(i){return atob(a[i]);}eval(d(0)+"('x')");"#,
+        );
+        assert!(has(&caps, "eval", "fetch('x')"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn infinite_loop_is_interrupted() {
+        // Must not hang: the interrupt handler aborts at the (short) deadline.
+        let limits = SandboxLimits {
+            max_memory: 32 * 1024 * 1024,
+            max_duration: Duration::from_millis(400),
+            max_scripts: 20,
+        };
+        let start = std::time::Instant::now();
+        let _ = run_deobfuscation_sandbox("while(true){}", &limits);
+        assert!(start.elapsed() < Duration::from_secs(5), "interrupt did not fire");
+    }
+
+    #[test]
+    fn clean_script_captures_nothing() {
+        let caps = capture("var x = 1 + 2; function f(a){ return a*2; } f(x);");
+        assert!(caps.is_empty(), "clean script should capture nothing, got: {:?}", caps);
+    }
 }

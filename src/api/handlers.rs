@@ -414,6 +414,9 @@ pub async fn analyse(
                 // Tier-0 static deobfuscation: fold constants and re-analyse the
                 // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
                 crate::js::deobfuscate_and_reanalyse(&source_label, &source, &mut report);
+                // Tier-2 dynamic deobfuscation: sink-capture sandbox.
+                // (Large-JS deobfuscation — Phase 2)
+                crate::js::deep_deobfuscate(&source_label, &source, &mut report);
             }
 
             report

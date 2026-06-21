@@ -3,17 +3,25 @@ pub mod deobfuscate;
 pub mod runtime;
 pub mod vdom;
 
+use std::time::{Duration, Instant};
+
 use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::error::Result;
 use crate::html::{Framework, ProcessedHtml};
-use crate::threat::{NormalizedScript, ThreatReport};
+use crate::threat::{DecodedPayload, NormalizedScript, ThreatReport};
 use runtime::SandboxLimits;
 use vdom::DomSnapshot;
 
 /// Per-script cap on the folded source we transport back to the caller.
 const MAX_NORMALIZED_BYTES: usize = 256 * 1024;
+/// Per-payload cap on transported decoded code, and the overall wall-clock for
+/// one script's recursive (Tier-2) deobfuscation.
+const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
+const DEEP_DEOBF_BUDGET: Duration = Duration::from_secs(8);
+/// Skip the sandbox for scripts larger than this — too big to safely interpret.
+const DEEP_DEOBF_MAX_INPUT: usize = 1024 * 1024;
 
 fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
@@ -50,6 +58,41 @@ pub fn deobfuscate_and_reanalyse(name: &str, source: &str, report: &mut ThreatRe
         fold_count: result.fold_count,
         normalized,
     });
+}
+
+/// Tier-2 dynamic deobfuscation for one script: when obfuscation markers are
+/// present, run the sink-capture sandbox recursively, then re-analyse every
+/// recovered payload (so AST checks see the cleartext) and record it as a
+/// `decoded_payloads` artifact. Gated on markers + size so clean/huge scripts are
+/// skipped. Executes the script in a capability-free, time/memory-capped sandbox.
+pub fn deep_deobfuscate(name: &str, source: &str, report: &mut ThreatReport) {
+    if source.len() > DEEP_DEOBF_MAX_INPUT || !deobfuscate::looks_obfuscated(source) {
+        return;
+    }
+    let limits = SandboxLimits {
+        max_memory: 64 * 1024 * 1024,
+        max_duration: Duration::from_secs(3),
+        max_scripts: 20,
+    };
+    let deadline = Instant::now() + DEEP_DEOBF_BUDGET;
+    let payloads = deobfuscate::deobfuscate_deep(source, &limits, deadline);
+    if payloads.is_empty() {
+        return;
+    }
+    info!("deobf: {} recovered {} dynamic payload(s)", name, payloads.len());
+    for p in payloads {
+        analysis::analyse(&p.code, &format!("{name}+deob[{}:L{}]", p.sink, p.layer), report);
+        let mut code = p.code;
+        if code.len() > MAX_PAYLOAD_BYTES {
+            code.truncate(MAX_PAYLOAD_BYTES);
+        }
+        report.add_decoded_payload(DecodedPayload {
+            source_name: name.to_string(),
+            sink: p.sink,
+            layer: p.layer,
+            code,
+        });
+    }
 }
 
 /// Output of the JS processing stage.
@@ -97,6 +140,10 @@ impl JsProcessor {
             // Tier-0 static deobfuscation: fold constants and re-analyse the
             // resolved source (no execution). (Large-JS deobfuscation — Phase 1)
             deobfuscate_and_reanalyse(&name, script, report);
+            // Tier-2 dynamic deobfuscation: sink-capture sandbox for obfuscated
+            // scripts (decouples deobfuscation from framework detection).
+            // (Large-JS deobfuscation — Phase 2)
+            deep_deobfuscate(&name, script, report);
         }
 
         // External scripts: analysis of their source requires fetching.

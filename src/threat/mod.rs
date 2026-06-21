@@ -92,6 +92,19 @@ pub enum Severity {
 
 // ── ThreatReport ──────────────────────────────────────────────────────────────
 
+/// One payload recovered by Tier-2 dynamic deobfuscation (sandbox sink-capture).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodedPayload {
+    /// Source script the payload was recovered from, e.g. `inline[0]`.
+    pub source_name: String,
+    /// Sink that yielded it (`eval`, `Function`, `document.write`, `atob`, …).
+    pub sink: String,
+    /// Recursion layer (1 = first pass).
+    pub layer: usize,
+    /// The recovered code/string (capped for transport).
+    pub code: String,
+}
+
 /// One script after Tier-0 static deobfuscation (constant folding).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedScript {
@@ -155,6 +168,13 @@ pub struct ThreatReport {
     #[serde(default)]
     pub normalized_scripts: Vec<NormalizedScript>,
 
+    /// Tier-2 deobfuscation output: payloads the sandbox captured from
+    /// eval/Function/document.write/decode sinks while the script's own decoder
+    /// ran — the cleartext behind dynamic obfuscation. (Large-JS deobfuscation —
+    /// Phase 2 / Tier-2)
+    #[serde(default)]
+    pub decoded_payloads: Vec<DecodedPayload>,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -176,6 +196,7 @@ impl ThreatReport {
             render_mode: String::new(),
             rendered_html: String::new(),
             normalized_scripts: Vec::new(),
+            decoded_payloads: Vec::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),
@@ -383,6 +404,14 @@ impl ThreatReport {
         const MAX_NORMALIZED_SCRIPTS: usize = 25;
         if self.normalized_scripts.len() < MAX_NORMALIZED_SCRIPTS {
             self.normalized_scripts.push(script);
+        }
+    }
+
+    /// Record a Tier-2 decoded payload. Bounded for transport.
+    pub fn add_decoded_payload(&mut self, payload: DecodedPayload) {
+        const MAX_DECODED_PAYLOADS: usize = 40;
+        if self.decoded_payloads.len() < MAX_DECODED_PAYLOADS {
+            self.decoded_payloads.push(payload);
         }
     }
 

