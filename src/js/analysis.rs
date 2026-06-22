@@ -26,6 +26,24 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
     // Pre-scan: detect navigator.userAgent presence for webdriver suppression logic.
     let has_user_agent_check = source.contains("navigator.userAgent");
 
+    // EtherHiding (ClearFake — G4): a read-only on-chain `eth_call` with a contract
+    // address and NO user wallet is the ClearFake stage-2 retrieval. Legitimate
+    // dApps read through the visitor's injected wallet (window.ethereum); an
+    // anonymous public-node eth_call does not occur on a benign page. Flagged
+    // MEDIUM; the Python scorer escalates when paired with a delivery lure. This
+    // runs on re-analysed deobfuscated / decoded / rendered script too, so it
+    // catches obfuscated ClearFake loaders post-deobfuscation at render time.
+    if source.contains("eth_call")
+        && !source.contains("window.ethereum")
+        && !source.contains("eth_requestAccounts")
+        && !source.contains("eth_sendTransaction")
+        && !source.contains("personal_sign")
+        && !source.contains("eth_signTypedData")
+        && has_contract_address(source)
+    {
+        report.add_js_flag(JsFlag::EtherHidingRead);
+    }
+
     let mut visitor = SecurityVisitor {
         report,
         source_name: source_name.to_string(),
@@ -524,6 +542,26 @@ fn base64_decode(s: &str) -> Result<String, ()> {
     String::from_utf8(bytes).map_err(|_| ())
 }
 
+/// True if `s` contains an Ethereum/BSC contract address literal: `0x` followed
+/// by exactly 40 hex digits (not part of a longer hex run).
+fn has_contract_address(s: &str) -> bool {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    while i + 42 <= n {
+        if b[i] == b'0' && (b[i + 1] == b'x' || b[i + 1] == b'X') {
+            let run_is_hex = b[i + 2..i + 42].iter().all(u8::is_ascii_hexdigit);
+            let prev_ok = i == 0 || !b[i - 1].is_ascii_hexdigit();
+            let next_ok = i + 42 >= n || !b[i + 42].is_ascii_hexdigit();
+            if run_is_hex && prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn looks_hex_obfuscated(s: &str) -> bool {
     let hex_count = s.matches("\\x").count();
     hex_count > 5 && (hex_count * 4 * 100 / s.len()) > 30
@@ -695,5 +733,25 @@ mod tests {
     fn benign_string_not_flagged_as_wallet_api() {
         let report = run(r#"var x = "send_transaction_to_server";"#);
         assert!(!report.js_flags().iter().any(|f| matches!(f, JsFlag::CryptoWalletApi { .. })));
+    }
+
+    #[test]
+    fn detects_etherhiding_eth_call_no_wallet() {
+        // Raw JSON-RPC eth_call to a contract, no wallet → EtherHiding.
+        let report = run(r#"fetch(rpc,{method:'POST',body:JSON.stringify({method:"eth_call",params:[{to:"0x1234567890abcdef1234567890abcdef12345678",data:"0x"}]})})"#);
+        assert!(report.js_flags().iter().any(|f| matches!(f, JsFlag::EtherHidingRead)));
+    }
+
+    #[test]
+    fn wallet_dapp_not_flagged_as_etherhiding() {
+        // A real dApp uses the injected wallet — must NOT fire EtherHiding.
+        let report = run(r#"window.ethereum.request({method:"eth_call",params:[{to:"0x1234567890abcdef1234567890abcdef12345678"}]})"#);
+        assert!(!report.js_flags().iter().any(|f| matches!(f, JsFlag::EtherHidingRead)));
+    }
+
+    #[test]
+    fn eth_call_without_contract_not_flagged() {
+        let report = run(r#"var m = "eth_call";"#);
+        assert!(!report.js_flags().iter().any(|f| matches!(f, JsFlag::EtherHidingRead)));
     }
 }

@@ -81,6 +81,11 @@ pub enum JsFlag {
     /// …) appears in the script — the core action of a Web3 wallet drainer. Strong
     /// signal once it surfaces in deobfuscated code. (Large-JS deobfuscation — Phase 4)
     CryptoWalletApi { method: String },
+    /// EtherHiding: a read-only on-chain payload fetch (`eth_call` JSON-RPC) with
+    /// no user wallet — the ClearFake stage-2 retrieval technique. Surfaced here
+    /// when it appears in (re-analysed, deobfuscated, or rendered) script so it
+    /// participates in the ClearFake context-collapse rule. (ClearFake — G4)
+    EtherHidingRead,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +408,10 @@ impl ThreatReport {
             JsFlag::CryptoWalletApi { method } => {
                 self.push_flag(Severity::High, "CRYPTO_WALLET_API",
                     format!("wallet RPC method: {}", method));
+            }
+            JsFlag::EtherHidingRead => {
+                self.push_flag(Severity::Medium, "ETHERHIDING_ONCHAIN_READ",
+                    "eth_call on-chain read with no wallet (ClearFake EtherHiding)".into());
             }
             _ => {}
         }
