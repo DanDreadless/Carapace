@@ -5,7 +5,7 @@ name = "carapace"
 # reset to 0 and carry left.  When the leftmost would overflow, prepend a new '1':
 #   0.2.9 -> 0.3.0,  0.9.9 -> 1.0.0,  9.9.9 -> 1.0.0.0
 # This mirrors the Insight detection engine versioning scheme.
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Safe HTML/CSS/JS renderer for security researchers"
 license = "MIT"
