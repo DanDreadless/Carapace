@@ -32,10 +32,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # no Rust toolchain, and no source code.
 #
 # Security posture inside the container:
-#   - Non-root user (uid 1000)
-#   - Chromium runs with --disable-javascript + network kill-switch
-#     (--proxy-server=socks5://127.0.0.1:1), so even --no-sandbox is safe
-#   - All capabilities dropped at runtime via docker run / compose
+#   - Non-root user (uid 1000) — never run as root.
+#   - NOTE: Chromium now renders with JavaScript ENABLED (it executes
+#     attacker-controlled JS) and has real network egress via the in-process
+#     policy/logging proxy + a vetted CDN bypass. The old "JS disabled + dead
+#     socks5 proxy" rationale for --no-sandbox NO LONGER HOLDS. With the Chromium
+#     sandbox off, the *container* is the only trust boundary — it MUST be run
+#     locked down. docker-compose.prod.yml provides: cap_drop ALL ·
+#     no-new-privileges · read_only rootfs + tmpfs scratch · mem/cpus/pids limits ·
+#     a dedicated render-only network with NO route to redis/db/internal services.
+#     Follow-up (not yet done): run under gVisor (runsc) and/or restore the
+#     Chromium sandbox to contain a renderer 0-day; allow-list outbound egress.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
