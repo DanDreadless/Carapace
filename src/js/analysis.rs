@@ -44,6 +44,25 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
         report.add_js_flag(JsFlag::EtherHidingRead);
     }
 
+    // Ghost code (EvilTokens — G4): the page body is delivered as an AES-GCM blob
+    // decrypted client-side with the WebCrypto API and injected into the DOM. The
+    // bootstrap loader is plaintext (only the body is encrypted), so this static
+    // source check works even though the JS-disabled render never decrypts it.
+    // Requires the WebCrypto AES-GCM decrypt + a DOM-HTML sink + a blob source so it
+    // does not fire on benign WebCrypto use (e.g. E2E message decrypt to textContent).
+    if (source.contains("crypto.subtle.decrypt") || source.contains("crypto.subtle.importKey"))
+        && source.contains("AES-GCM")
+        && (source.contains(".innerHTML")
+            || source.contains(".outerHTML")
+            || source.contains("insertAdjacentHTML")
+            || source.contains("document.write"))
+        && (source.contains("fetch(")
+            || source.contains("XMLHttpRequest")
+            || source.contains("atob("))
+    {
+        report.add_js_flag(JsFlag::ClientSideDecryptedPage);
+    }
+
     let mut visitor = SecurityVisitor {
         report,
         source_name: source_name.to_string(),

@@ -86,6 +86,12 @@ pub enum JsFlag {
     /// when it appears in (re-analysed, deobfuscated, or rendered) script so it
     /// participates in the ClearFake context-collapse rule. (ClearFake — G4)
     EtherHidingRead,
+    /// "Ghost code" (EvilTokens device-code PhaaS): the page body is delivered as an
+    /// AES-GCM blob decrypted client-side via the WebCrypto API and injected into the
+    /// DOM. The phishing UI never appears in source and a JS-disabled render never
+    /// materialises it, so this source-level flag on the plaintext loader is the only
+    /// render-independent signal. (EvilTokens — G4)
+    ClientSideDecryptedPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +418,10 @@ impl ThreatReport {
             JsFlag::EtherHidingRead => {
                 self.push_flag(Severity::Medium, "ETHERHIDING_ONCHAIN_READ",
                     "eth_call on-chain read with no wallet (ClearFake EtherHiding)".into());
+            }
+            JsFlag::ClientSideDecryptedPage => {
+                self.push_flag(Severity::High, "CLIENTSIDE_DECRYPTED_PAGE",
+                    "AES-GCM client-side page decryption injected into DOM (EvilTokens ghost code)".into());
             }
             _ => {}
         }
