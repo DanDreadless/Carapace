@@ -88,11 +88,14 @@ carapace render <URL> -o <FILE> [OPTIONS]
 | `--width <PX>` | `1280` | Viewport width in pixels |
 | `--height <PX>` | `800` | Viewport height in pixels (0 = full-page capture) |
 | `--mobile-screenshot` | off | Capture a second screenshot at 375×844 (iPhone viewport) alongside the desktop render |
+| `--mobile-ua` | off | Use an iPhone/Safari User-Agent for the fetch and render — reveals pages that cloak content by User-Agent (blank to desktop, real phish to mobile) |
+| `--android-ua` | off | Use an Android/Chrome User-Agent instead of iPhone; takes precedence over `--mobile-ua` |
 | `--timeout <SECS>` | `30` | Request timeout |
 | `--max-size <SIZE>` | `10MB` | Max response size (`5MB`, `500KB`, etc.) |
 | `--max-redirects <N>` | `5` | Max redirect hops |
+| `--block-private-ips` | on | Block requests to private/loopback/link-local IP ranges (SSRF protection) |
 | `--https-only` | off | Reject plain HTTP URLs |
-| `--no-assets` | off | Skip fetching images and stylesheets |
+| `--no-assets` | off | Skip fetching sub-resources (images, stylesheets, fonts) |
 | `--no-browser` | off | Use the built-in Rust renderer instead of Chromium |
 | `--no-js-sandbox` | off | Skip the rquickjs runtime (static analysis only) |
 | `--threat-report` | on | Write `<output>.threat.json` alongside the render |
@@ -110,8 +113,10 @@ carapace serve [OPTIONS]
 | `--host <HOST>` | `0.0.0.0` | Bind address |
 | `--api-key <KEY>` | none | Require `X-API-Key` header (also `CARAPACE_API_KEY` env var) |
 | `--max-concurrent <N>` | `4` | Max parallel render jobs |
+| `--block-private-ips` | on | Block requests to private/loopback IP ranges in submitted URLs (SSRF protection) |
 | `--https-only` | off | Reject plain HTTP URLs submitted to the API |
 | `--timeout <SECS>` | `30` | Per-request fetch timeout |
+| `-v, --verbose` | off | Enable debug logging |
 
 ---
 
@@ -123,7 +128,7 @@ carapace serve [OPTIONS]
 curl http://localhost:8080/health
 ```
 ```json
-{ "status": "ok", "version": "0.2.1" }
+{ "status": "ok", "version": "0.2.3" }
 ```
 
 ### `POST /render`
@@ -145,6 +150,8 @@ curl -s -X POST http://localhost:8080/render -H "Content-Type: application/json"
   "no_browser": false,
   "no_js_sandbox": false,
   "mobile_screenshot": false,
+  "mobile_ua": false,
+  "android_ua": false,
   "max_size": null
 }
 ```
@@ -199,26 +206,35 @@ Every render produces a threat report. When using the CLI it is written to `<out
 ```json
 {
   "url": "https://example.com",
-  "scanned_at": "2026-04-18T09:00:00Z",
-  "risk_score": 0,
+  "timestamp": "2026-04-18T09:00:00Z",
   "framework_detected": "Unknown",
   "tech_stack": [],
-  "flags": [],
-  "blocked_network": [],
-  "js_flags": [],
+  "risk_score": 0,
+  "render_skipped": false,
+  "render_blank": false,
+  "blank_ratio": 0.0,
+  "render_mode": "live",
+  "rendered_html": "",
+  "normalized_scripts": [],
+  "decoded_payloads": [],
   "html_flags": [],
-  "drive_by_downloads": [],
-  "render_skipped": false
+  "js_flags": [],
+  "blocked_network": [],
+  "flags": []
 }
 ```
 
-**Risk score** is 0–100. Flags from static JS analysis, HTML sanitisation, CSS overlay detection, post-render DOM diff, runtime network interception, and drive-by download detection all contribute to the score.
+**Risk score** is 0–100. Flags from static JS analysis, HTML sanitisation, CSS overlay detection, post-render DOM diff, runtime network interception, drive-by download detection, QR-code (quishing) decoding, and Browser-in-the-Browser detection all contribute to the score.
 
 **`blocked_network`** is a list of URLs that JavaScript attempted to reach at runtime. All were rejected by the logging proxy — nothing was fetched.
 
 **`html_flags`** and **`js_flags`** are raw sanitiser/static-analysis flag lists (one entry per occurrence, not deduplicated). The deduplicated `flags` array is the primary findings list; `html_flags` and `js_flags` provide accurate per-code counts for volume scoring.
 
 **`render_skipped`** is `true` when the content-type was not `text/html` — the HTML/render pipeline was bypassed and OXC JS analysis was run directly on the raw body (e.g. a `.js` URL submitted to `/analyse`).
+
+**`render_mode`** records which strategy produced the delivered screenshot: `"live"` (navigated the real URL through the same-origin proxy), `"offline_fallback"` (live render failed or came back blank → offline self-contained render), or `"offline"` (live disabled). **`render_blank`** is `true` when the delivered screenshot is effectively all near-white pixels after the retry ladder was exhausted, and **`blank_ratio`** (0.0–1.0) is the near-white pixel fraction behind that decision.
+
+**`rendered_html`** is the post-JS DOM of a successful live render (capped for transport), letting a caller re-run the analysers on what the browser actually rendered — essential for service-worker-gated content (IPFS `dweb.link`) and fully JS-rendered SPAs. **`normalized_scripts`** (Tier-0 deobfuscation: constants folded) and **`decoded_payloads`** (Tier-2: cleartext captured from `eval`/`Function`/`document.write` sinks while the script's own decoder ran) expose the resolved payload behind obfuscation.
 
 ### Flag codes
 
@@ -241,7 +257,18 @@ Every render produces a threat report. When using the CLI it is written to `<out
 | `DYNAMIC_OVERLAY_INJECTED` | DOM diff | Viewport-spanning element present in the post-JS DOM but absent from static HTML — JS-injected overlay |
 | `DYNAMIC_OVERLAY_INJECTED_CLICKFIX` | DOM diff | JS-injected overlay confirmed alongside clipboard hijack — complete ClickFix attack chain |
 | `INTERCEPTED_REQUEST` | Runtime | URLs JavaScript attempted to fetch at runtime (all blocked); list in evidence |
+| `NETWORK_ATTEMPT_BLOCKED` | Runtime (sandbox) | `fetch` / `XMLHttpRequest` / `WebSocket` call attempted inside the rquickjs sandbox and blocked; kind → URL in evidence |
 | `DRIVE_BY_DOWNLOAD` | Fetcher | Automatic file download intercepted (executables/archives only; images/fonts suppressed) |
+| `CRYPTO_WALLET_API` | Static / runtime | Wallet RPC method invoked (e.g. `eth_sendTransaction`) — wallet-drainer behaviour |
+| `ETHERHIDING_ONCHAIN_READ` | Runtime | `eth_call` on-chain read with no connected wallet — ClearFake EtherHiding C2 |
+| `CLIENTSIDE_DECRYPTED_PAGE` | Runtime | AES-GCM client-side page decryption injected into the DOM (EvilTokens ghost code) |
+| `OBFUSCATION_UNRESOLVED` | Static | Obfuscated code that could not be statically resolved; detail in evidence |
+| `QR_CODE_URL` | Renderer | URL payload decoded from a QR code in page images or the rendered screenshot (quishing) |
+| `BITB_FAKE_WINDOW` | HTML analyser | Browser-in-the-Browser: a fake window frame rendering another brand's login URL as address-bar text above a password field (Sneaky2FA / M365 / Facebook BitB) — **Critical** |
+| `BLOCKED_ELEMENT_SCRIPT` | HTML sanitiser | `<script>` tag removed before render |
+| `BLOCKED_ELEMENT_IFRAME` | HTML sanitiser | `<iframe>` tag removed before render |
+| `BLOCKED_ELEMENT_OTHER` | HTML sanitiser | Other disallowed element (`<object>`, `<embed>`, `<form>`, …) removed |
+| `JAVASCRIPT_URL_STRIPPED` | HTML sanitiser | `javascript:` URI or other blocked (non-`on*`) attribute removed |
 | `SANDBOX_EVASION_WEBDRIVER` | Static | `navigator.webdriver` read — anti-analysis probe |
 | `SANDBOX_EVASION_HEADLESS_STRING` | Static | Headless browser identifier string (`HeadlessChrome`, `PhantomJS`, `$cdc_`) |
 | `SANDBOX_EVASION_SCREEN_PROBE` | Static | `window.outerHeight`/`outerWidth` read — headless detection |
