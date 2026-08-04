@@ -9,9 +9,9 @@
 /// HTTP/HTTPS requests return ECONNREFUSED and no data leaves the machine.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -352,6 +352,46 @@ fn chromium_cmd() -> &'static str {
     "chromium"
 }
 
+static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique, writable Chromium `--user-data-dir` on the tmpfs at `/tmp`, removed
+/// when the guard drops (after the Chromium process exits).
+///
+/// Chromium `--headless=new` must create a profile directory on startup. The
+/// production container runs with a read-only root filesystem — only `/tmp` is a
+/// writable tmpfs, and `$HOME` is read-only — so Chromium's default profile location
+/// is unwritable and every launch fails with "Failed to create headless user data
+/// directory container", which silently disabled all live rendering under the
+/// read-only hardening. Passing an explicit `--user-data-dir` under `/tmp` fixes it.
+/// A unique dir per launch (pid + nanos + a process-wide sequence counter) avoids the
+/// `SingletonLock` contention a shared profile would cause across the concurrent
+/// renders Carapace serves.
+struct ChromeProfile(PathBuf);
+
+impl ChromeProfile {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = PROFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("carapace-chrome-{}-{}-{}", std::process::id(), nanos, seq));
+        ChromeProfile(p)
+    }
+
+    /// The `--user-data-dir=<path>` argument to pass to Chromium.
+    fn arg(&self) -> String {
+        format!("--user-data-dir={}", self.0.display())
+    }
+}
+
+impl Drop for ChromeProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn render_chromium(
     html_path: &Path,
     output_path: &Path,
@@ -384,6 +424,12 @@ fn render_chromium(
     // payment form scripts directly, eliminating the most common causes of
     // blank or unstyled screenshots across all page types.
     let bypass_arg = format!("--proxy-bypass-list={}", CDN_PROXY_BYPASS);
+
+    // Writable profile dir on /tmp — required under the read-only root filesystem
+    // (see ChromeProfile). Kept alive until after cmd.output() so the dir is cleaned
+    // up only once Chromium has exited.
+    let profile = ChromeProfile::new();
+    let profile_arg = profile.arg();
 
     let mut cmd = Command::new(chromium_cmd());
     cmd.args([
@@ -432,6 +478,7 @@ fn render_chromium(
         &file_url,
     ]);
     cmd.arg(&bypass_arg);
+    cmd.arg(&profile_arg);
     let out = cmd.output()
         .map_err(|e| CarapaceError::Render(format!("chromium launch: {}", e)))?;
 
@@ -509,6 +556,10 @@ pub fn render_to_png_live(
     let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
     let proxy_arg = proxy.proxy_arg();
 
+    // Writable profile dir on /tmp — required under the read-only root filesystem.
+    let profile = ChromeProfile::new();
+    let profile_arg = profile.arg();
+
     let mut cmd = Command::new(chromium_cmd());
     cmd.args([
         "--headless=new",
@@ -535,6 +586,7 @@ pub fn render_to_png_live(
         &timeout_arg,
         &window_size,
         &screenshot_arg,
+        &profile_arg,
         url,
     ]);
 
@@ -580,6 +632,10 @@ pub fn dump_dom_live(url: &str, ua: &str, page_host: &str, settle_ms: u32) -> St
     let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
     let proxy_arg = proxy.proxy_arg();
 
+    // Writable profile dir on /tmp — required under the read-only root filesystem.
+    let profile = ChromeProfile::new();
+    let profile_arg = profile.arg();
+
     let result = Command::new(chromium_cmd())
         .args([
             "--headless=new",
@@ -598,6 +654,7 @@ pub fn dump_dom_live(url: &str, ua: &str, page_host: &str, settle_ms: u32) -> St
             "--run-all-compositor-stages-before-draw",
             &timeout_arg,
             &proxy_arg,
+            &profile_arg,
             "--dump-dom",
             url,
         ])
@@ -783,6 +840,10 @@ pub fn dump_dom(html_path: &Path, ua: &str) -> String {
     let proxy = LoggingProxy::start();
     let proxy_arg = proxy.proxy_arg();
 
+    // Writable profile dir on /tmp — required under the read-only root filesystem.
+    let profile = ChromeProfile::new();
+    let profile_arg = profile.arg();
+
     let result = Command::new(chromium_cmd())
         .args([
             "--headless=new",
@@ -804,6 +865,7 @@ pub fn dump_dom(html_path: &Path, ua: &str) -> String {
             // (e.g. ClickFix clipboard event loops, busy-wait anti-debug patterns).
             "--timeout=8000",
             &proxy_arg,
+            &profile_arg,
             "--dump-dom",
             &file_url,
         ])
