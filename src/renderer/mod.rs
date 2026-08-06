@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod bootstrap;
 pub mod cdp;
 pub mod proxy;
 

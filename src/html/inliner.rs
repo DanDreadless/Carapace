@@ -64,110 +64,13 @@ impl HtmlInliner {
         // Chromium render with all network requests blocked by the logging proxy.
         // No data can reach an external host regardless of what the page does.
         if let Some(head) = find_element(&dom.document, "head") {
-            const WINDOWS_BOOTSTRAP: &str = r#"
-(function() {
-  try {
-    Object.defineProperty(navigator, 'platform',    {get: function() { return 'Win32'; }});
-    Object.defineProperty(navigator, 'oscpu',       {get: function() { return 'Windows NT 10.0; Win64; x64'; }});
-    Object.defineProperty(navigator, 'appVersion',  {get: function() { return '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'; }});
-  } catch(e) {}
-  // Suppress navigation so overlays render fully before the screenshot is taken.
-  try {
-    window.location.replace = function() {};
-    window.location.assign  = function() {};
-    window.location.reload  = function() {};
-  } catch(e) {}
-  try {
-    var _d = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-    if (_d) {
-      Object.defineProperty(Location.prototype, 'href', {
-        get: _d.get,
-        set: function() {},
-        configurable: true
-      });
-    }
-  } catch(e) {}
-  // Mock fetch() and XMLHttpRequest so Vue/React apps that wait on API calls
-  // receive an immediate empty-but-successful response and can render their UI.
-  try {
-    window.fetch = function(url, opts) {
-      return Promise.resolve(new Response('{}', {
-        status: 200,
-        headers: {'Content-Type': 'application/json'}
-      }));
-    };
-  } catch(e) {}
-  try {
-    window.XMLHttpRequest = function() {
-      var self = this;
-      self.open = function() {};
-      self.setRequestHeader = function() {};
-      self.send = function() {
-        var me = self;
-        setTimeout(function() {
-          Object.defineProperty(me, 'readyState',   {get: function(){return 4;}});
-          Object.defineProperty(me, 'status',       {get: function(){return 200;}});
-          Object.defineProperty(me, 'responseText', {get: function(){return '{}';}});
-          Object.defineProperty(me, 'response',     {get: function(){return '{}';}});
-          if (me.onreadystatechange) me.onreadystatechange();
-          if (me.onload) me.onload();
-        }, 0);
-      };
-    };
-  } catch(e) {}
-  // Loader-screen killer — MutationObserver fires synchronously on every DOM
-  // mutation so it does NOT depend on virtual-time advancing (unlike setTimeout).
-  // When Vue/React mounts and creates #app-loading, the observer fires immediately
-  // in the same microtask checkpoint and removes it before the next paint.
-  //
-  // Two strategies are combined:
-  //   1. Named-selector kill: targets IDs/classes used by common phishing kits.
-  //   2. Appearance-based kill: removes ANY fullscreen white/near-white fixed
-  //      overlay regardless of what name the kit chose, by checking computed
-  //      position, size, and background colour.
-  function _killLoaders() {
-    try {
-      var sel = '#app-loading,#loading,#preloader,#loader,#splash,#page-loader,' +
-                '[id*="loading"],[id*="preloader"],[id*="spinner"],[id*="splash"],' +
-                '[class*="app-loading"],[class*="loading-screen"],[class*="page-loader"],' +
-                '[class*="preloader"],[class*="spinner"]';
-      document.querySelectorAll(sel).forEach(function(el) {
-        try {
-          // setProperty with 'important' beats inline style="display:x !important"
-          el.style.setProperty('display',     'none',   'important');
-          el.style.setProperty('visibility',  'hidden', 'important');
-          el.remove();
-        } catch(ex) {}
-      });
-      // Kill any white/near-white fullscreen fixed overlay regardless of name.
-      document.querySelectorAll('div,section,main,aside,header,footer').forEach(function(el) {
-        try {
-          var cs = window.getComputedStyle(el);
-          if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
-          var r = el.getBoundingClientRect();
-          if (!r || r.width < window.innerWidth * 0.8 || r.height < window.innerHeight * 0.8) return;
-          var m = cs.backgroundColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-          if (m && +m[1] >= 230 && +m[2] >= 230 && +m[3] >= 230) {
-            el.style.setProperty('display', 'none', 'important');
-            el.remove();
-          }
-        } catch(ex) {}
-      });
-    } catch(e) {}
-  }
-  // Install observer before any page script runs.
-  try {
-    var _obs = new MutationObserver(function() { _killLoaders(); });
-    _obs.observe(document.documentElement || document, {
-      childList: true, subtree: true,
-      attributes: true, attributeFilter: ['style','class','id']
-    });
-  } catch(e) {}
-  // Also sweep on DOMContentLoaded and first rAF as belt-and-braces.
-  try { document.addEventListener('DOMContentLoaded', _killLoaders, {once:true}); } catch(e) {}
-  try { requestAnimationFrame(_killLoaders); } catch(e) {}
-})();
-"#;
+            // Offline-path bootstrap = shared identity/nav/loader handling + the
+            // offline-only fetch/XHR mock (CARAPACE-09 P2 split; behaviourally
+            // identical to the former single WINDOWS_BOOTSTRAP blob). The CDP live
+            // path injects only the shared IDENTITY_NAV_BOOTSTRAP so it keeps real
+            // same-origin fetch through the SSRF proxy.
+            let windows_bootstrap = crate::renderer::bootstrap::offline_bootstrap();
+
             // <base href> must be the first element in <head> so that all
             // subsequent elements — and JS-created elements at runtime — resolve
             // protocol-relative URLs against the original page's HTTPS origin
@@ -175,7 +78,7 @@ impl HtmlInliner {
             let base_tag = make_base_tag(&self.base_url);
             head.children.borrow_mut().insert(0, base_tag);
 
-            let bootstrap = make_script_node(WINDOWS_BOOTSTRAP);
+            let bootstrap = make_script_node(&windows_bootstrap);
             head.children.borrow_mut().insert(1, bootstrap);
 
             // Inject a CSS rule that hides common loading-screen elements via
