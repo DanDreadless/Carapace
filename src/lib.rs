@@ -292,6 +292,9 @@ fn browser_render(
                         screenshot_result = Ok(out.intercepted);
                         render_mode = "live_cdp";
                         cdp_dom = Some(out.dom);
+                        report.runtime_scripts = out.runtime_scripts.into_iter()
+                            .map(|(url, body)| crate::threat::RuntimeScript { url, body })
+                            .collect();
                     }
                 }
                 Err(e) => info!("CDP live render failed ({}) — falling back", e),

@@ -125,6 +125,13 @@ pub struct DecodedPayload {
     pub code: String,
 }
 
+/// A JS body captured from the network at render time (CDP Network capture).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeScript {
+    pub url: String,
+    pub body: String,
+}
+
 /// One script after Tier-0 static deobfuscation (constant folding).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedScript {
@@ -195,6 +202,13 @@ pub struct ThreatReport {
     #[serde(default)]
     pub decoded_payloads: Vec<DecodedPayload>,
 
+    /// Runtime-fetched JS bodies captured via CDP Network (`{url, body}`) — scripts
+    /// loaded via fetch()+eval / dynamic import() that never appear as a `<script>`
+    /// tag, so neither the static pass nor the rendered-DOM re-fetch sees them.
+    /// Populated only under `CARAPACE_CDP_CAPTURE`. (CARAPACE-11 Part B / CDP capture)
+    #[serde(default)]
+    pub runtime_scripts: Vec<RuntimeScript>,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -217,6 +231,7 @@ impl ThreatReport {
             rendered_html: String::new(),
             normalized_scripts: Vec::new(),
             decoded_payloads: Vec::new(),
+            runtime_scripts: Vec::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),

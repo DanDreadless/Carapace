@@ -243,6 +243,44 @@ impl CdpPipe {
         }
     }
 
+    /// Drain the event pipe for `dur`, queueing events into `self.events`. Unlike a
+    /// blind sleep, this keeps reading so an enabled Network domain's per-request
+    /// events cannot fill the pipe buffer and stall Chromium. Uses `poll()` for the
+    /// wait so quiet periods don't block; consumes any message already buffered in the
+    /// BufReader first (poll can't see those).
+    fn drain_for(&mut self, dur: Duration) {
+        let deadline = Instant::now() + dur;
+        let fd = self.evt.get_ref().as_raw_fd();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            // A complete message may already sit in the BufReader buffer (poll only
+            // sees the raw fd, not buffered bytes) — consume it without polling.
+            if self.evt.buffer().contains(&0u8) {
+                match self.read_message() {
+                    Ok(m) if m.get("method").is_some() => self.events.push(m),
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+                continue;
+            }
+            let ms = (deadline - now).as_millis().min(100) as libc::c_int;
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: single valid pollfd; poll does not retain the pointer.
+            let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if rc <= 0 {
+                continue; // timeout (quiet) or EINTR — keep waiting until the deadline
+            }
+            match self.read_message() {
+                Ok(m) if m.get("method").is_some() => self.events.push(m),
+                Ok(_) => {}
+                Err(_) => return, // pipe closed
+            }
+        }
+    }
+
     /// SIGKILL the browser's whole process group and reap it.
     fn kill(&mut self) {
         // SAFETY: pgid is the child's own group (process_group(0)); killpg targets
@@ -362,6 +400,10 @@ pub fn run_spike(navigate_url: &str, deadline: Duration) -> Result<SpikeOutput> 
 pub struct CdpRenderOutput {
     pub intercepted: Vec<String>,
     pub dom: String,
+    /// Runtime-fetched script bodies captured via CDP Network (url, body). Empty
+    /// unless `CARAPACE_CDP_CAPTURE` is enabled. Covers scripts loaded via
+    /// `fetch()+eval` / dynamic `import()` that never appear as `<script>` tags.
+    pub runtime_scripts: Vec<(String, String)>,
 }
 
 /// Max full-page capture height, matching the CLI path's sentinel.
@@ -429,6 +471,13 @@ pub fn cdp_render(
     // Hard wall-clock deadline: settle + slack for launch/navigate/capture.
     let deadline = Duration::from_millis(settle as u64 + 6000);
 
+    // CDP Network response-body capture (runtime scripts with no <script> tag).
+    // Default OFF — it enables the Network domain (per-request events) so it must
+    // be validated before affecting the default render path.
+    let capture = std::env::var("CARAPACE_CDP_CAPTURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+
     // Same-origin SSRF-enforcing forwarding proxy as the CLI live path.
     let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
     let proxy_arg = proxy.proxy_arg();
@@ -455,7 +504,7 @@ pub fn cdp_render(
     };
     let (done, watchdog) = spawn_watchdog(sess.pgid, deadline);
 
-    let result = (|| -> Result<String> {
+    let result = (|| -> Result<(String, Vec<(String, String)>)> {
         let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
         let target_id = created
             .get("targetId")
@@ -473,8 +522,12 @@ pub fn cdp_render(
             .ok_or_else(|| err("no sessionId"))?
             .to_string();
 
-        // No Page/Runtime/Network domain is enabled: only command responses cross
-        // the pipe, so a page emitting console/network events cannot flood it.
+        // No Page/Runtime domain is enabled (they emit console/execution events);
+        // Network is enabled ONLY under the capture flag, and drain_for() keeps its
+        // per-request events drained so the pipe cannot fill.
+        if capture {
+            sess.call(Some(&sid), "Network.enable", json!({}))?;
+        }
         sess.call(
             Some(&sid),
             "Emulation.setDeviceMetricsOverride",
@@ -490,10 +543,10 @@ pub fn cdp_render(
 
         sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
 
-        // Bounded settle: let the page load through the proxy and paint. Fixed
-        // sleep (network-idle event-counting is a later refinement); the watchdog
-        // is the hard cap. Events buffer harmlessly since no domain is enabled.
-        std::thread::sleep(Duration::from_millis(settle as u64));
+        // Bounded settle: let the page load through the proxy and paint. drain_for
+        // keeps the pipe empty (so an enabled Network domain can't stall Chromium)
+        // and collects Network events; the watchdog is the hard cap.
+        sess.drain_for(Duration::from_millis(settle as u64));
         // Best-effort: wait for web fonts before capture (bounded by awaitPromise
         // + the watchdog). Ignore failure.
         let _ = sess.call(
@@ -543,7 +596,45 @@ pub fn cdp_render(
             .take(MAX_DOM_BYTES)
             .collect::<String>();
 
-        Ok(dom)
+        // CDP Network capture: pull the bodies of JS responses seen during load —
+        // including scripts loaded via fetch()+eval / import() that never became a
+        // <script> tag. Capped; only under the flag. Collect request ids first (the
+        // &events borrow) before issuing getResponseBody calls (&mut).
+        let mut runtime_scripts: Vec<(String, String)> = Vec::new();
+        if capture {
+            let mut reqs: Vec<(String, String)> = Vec::new();
+            for e in &sess.events {
+                if e.get("method").and_then(Value::as_str) != Some("Network.responseReceived") {
+                    continue;
+                }
+                let p = e.get("params");
+                let mime = p.and_then(|p| p.pointer("/response/mimeType")).and_then(Value::as_str).unwrap_or("");
+                let rurl = p.and_then(|p| p.pointer("/response/url")).and_then(Value::as_str).unwrap_or("");
+                let rid = p.and_then(|p| p.get("requestId")).and_then(Value::as_str).unwrap_or("");
+                let path = rurl.split('?').next().unwrap_or("");
+                let is_js = mime.contains("javascript") || mime.contains("ecmascript")
+                    || path.ends_with(".js") || path.ends_with(".mjs");
+                if is_js && !rid.is_empty() && !rurl.is_empty() && reqs.len() < 20 {
+                    reqs.push((rid.to_string(), rurl.to_string()));
+                }
+            }
+            for (rid, rurl) in reqs {
+                if let Ok(r) = sess.call(Some(&sid), "Network.getResponseBody", json!({ "requestId": rid })) {
+                    let raw = r.get("body").and_then(Value::as_str).unwrap_or("");
+                    let body = if r.get("base64Encoded").and_then(Value::as_bool).unwrap_or(false) {
+                        base64::engine::general_purpose::STANDARD.decode(raw).ok()
+                            .and_then(|v| String::from_utf8(v).ok()).unwrap_or_default()
+                    } else {
+                        raw.to_string()
+                    };
+                    if (16..=1_000_000).contains(&body.len()) {
+                        runtime_scripts.push((rurl, body));
+                    }
+                }
+            }
+        }
+
+        Ok((dom, runtime_scripts))
     })();
 
     done.store(true, Ordering::Relaxed);
@@ -553,7 +644,7 @@ pub fn cdp_render(
     let _ = std::fs::remove_dir_all(&profile);
     let intercepted = proxy.collect();
 
-    result.map(|dom| CdpRenderOutput { intercepted, dom })
+    result.map(|(dom, runtime_scripts)| CdpRenderOutput { intercepted, dom, runtime_scripts })
 }
 
 #[cfg(test)]
