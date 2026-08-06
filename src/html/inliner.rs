@@ -253,6 +253,11 @@ impl HtmlInliner {
                 None => break,
             };
 
+            // Offline-render fidelity (CARAPACE-09 P2/P3): force below-fold images
+            // to paint and stop the browser preferring a non-inlined responsive
+            // candidate over the inlined src. Pure DOM rewrite, no network.
+            normalize_render_hints(&child);
+
             // Determine action without holding a borrow across mutations.
             let action = match &child.data {
                 NodeData::Element { name, attrs, .. } => {
@@ -437,6 +442,39 @@ fn detach(node: &Handle) {
     }
 }
 
+/// Normalise render hints on a single element for the offline `file://` render
+/// (CARAPACE-09 P2/P3). Pure DOM rewrite — issues no network requests:
+///   * `<img>`/`<iframe loading="lazy">` -> `eager` so below-the-fold content
+///     paints in the screenshot instead of waiting for a scroll that never happens.
+///   * `<img>`: drop `srcset`/`sizes` so the browser uses the inlined `src` data
+///     URI rather than fetching a responsive candidate (offline-blocked -> blank).
+///   * `<source>`: drop `srcset` so a `<picture>` falls back to its inlined `<img>`.
+fn normalize_render_hints(handle: &Handle) {
+    let NodeData::Element { name, attrs, .. } = &handle.data else { return };
+    let tag = name.local.as_ref().to_ascii_lowercase();
+    if !matches!(tag.as_str(), "img" | "iframe" | "source") {
+        return;
+    }
+    let mut attrs = attrs.borrow_mut();
+    if tag == "img" || tag == "iframe" {
+        for a in attrs.iter_mut() {
+            if a.name.local.as_ref().eq_ignore_ascii_case("loading")
+                && a.value.as_ref().eq_ignore_ascii_case("lazy")
+            {
+                a.value = "eager".into();
+            }
+        }
+    }
+    if tag == "img" {
+        attrs.retain(|a| {
+            let n = a.name.local.as_ref();
+            !n.eq_ignore_ascii_case("srcset") && !n.eq_ignore_ascii_case("sizes")
+        });
+    } else if tag == "source" {
+        attrs.retain(|a| !a.name.local.as_ref().eq_ignore_ascii_case("srcset"));
+    }
+}
+
 fn get_attr(attrs: &[html5ever::Attribute], name: &str) -> Option<String> {
     attrs.iter().find_map(|a| {
         if a.name.local.as_ref().eq_ignore_ascii_case(name) {
@@ -471,4 +509,47 @@ fn detect_mime(bytes: &[u8]) -> &'static str {
         return "image/svg+xml";
     }
     "image/png"
+}
+
+#[cfg(test)]
+mod render_hint_tests {
+    use super::*;
+    use html5ever::{driver::ParseOpts, parse_document, tendril::TendrilSink};
+
+    // Run only the DOM-normalisation pass (process_subtree) on parsed HTML, then
+    // serialise — no bootstrap/JS injection, so assertions target normalisation alone.
+    fn normalise(html: &str) -> String {
+        let dom = parse_document(RcDom::default(), ParseOpts::default())
+            .from_utf8()
+            .read_from(&mut html.as_bytes())
+            .unwrap();
+        let inliner = HtmlInliner::new(vec![], HashMap::new(), vec![], "https://example.test/".into());
+        inliner.process_subtree(&dom.document);
+        serialize_dom(&dom).to_ascii_lowercase()
+    }
+
+    #[test]
+    fn lazy_becomes_eager_and_responsive_hints_stripped() {
+        let out = normalise(
+            r#"<html><body>
+                <img src="a.png" srcset="a-2x.png 2x" sizes="50vw" loading="lazy">
+                <iframe src="x" loading="lazy"></iframe>
+                <picture><source srcset="b.webp" type="image/webp"><img src="b.png"></picture>
+            </body></html>"#,
+        );
+        assert!(!out.contains("srcset"), "srcset/source-srcset must be stripped: {out}");
+        assert!(!out.contains("sizes="), "img sizes must be stripped: {out}");
+        assert!(!out.contains(r#"loading="lazy""#), "no lazy loading may remain: {out}");
+        assert!(out.contains(r#"loading="eager""#), "lazy must be rewritten to eager: {out}");
+        // The inlinable src attributes are preserved for later data-URI inlining.
+        assert!(out.contains("a.png") && out.contains("b.png"), "img src preserved: {out}");
+    }
+
+    #[test]
+    fn plain_images_are_untouched() {
+        let out = normalise(r#"<html><body><img src="a.png"><img src="b.png" loading="eager"></body></html>"#);
+        assert!(out.contains("a.png") && out.contains("b.png"));
+        assert!(!out.contains("lazy"), "must not introduce lazy loading: {out}");
+        assert!(!out.contains("srcset"), "must not introduce srcset: {out}");
+    }
 }
