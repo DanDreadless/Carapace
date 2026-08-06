@@ -23,7 +23,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::path::PathBuf;
@@ -243,40 +243,64 @@ impl CdpPipe {
         }
     }
 
-    /// Drain the event pipe for `dur`, queueing events into `self.events`. Unlike a
-    /// blind sleep, this keeps reading so an enabled Network domain's per-request
-    /// events cannot fill the pipe buffer and stall Chromium. Uses `poll()` for the
-    /// wait so quiet periods don't block; consumes any message already buffered in the
-    /// BufReader first (poll can't see those).
-    fn drain_for(&mut self, dur: Duration) {
-        let deadline = Instant::now() + dur;
+    /// Read one message: a buffered one if present (poll can't see BufReader bytes),
+    /// else `poll()` the fd for up to `timeout_ms`. Ok(Some)=message, Ok(None)=timeout,
+    /// Err=pipe closed. Keeps the pipe drained so an enabled Network domain's events
+    /// cannot fill the buffer and stall Chromium.
+    fn read_one(&mut self, fd: RawFd, timeout_ms: libc::c_int) -> Result<Option<Value>> {
+        if self.evt.buffer().contains(&0u8) {
+            return self.read_message().map(Some);
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: single valid pollfd; poll does not retain the pointer.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc <= 0 {
+            return Ok(None); // timeout or EINTR
+        }
+        self.read_message().map(Some)
+    }
+
+    /// Settle by **network-idle** (CARAPACE-09 P2): drain the event pipe and return
+    /// once no request has been in-flight for `quiet` — but never before `floor`
+    /// (so a delayed `setTimeout` overlay still injects and is captured — no
+    /// early-exit regression to ClickFix/SocGholish detection) nor after `max`.
+    /// Requires `Network.enable`; with Network off there are no events so it simply
+    /// waits `floor`. Only `Network.responseReceived` events are queued (for the
+    /// optional body capture), capped; request/finished are counted inline.
+    fn drain_until_idle(&mut self, floor: Duration, max: Duration, quiet: Duration) {
+        const MAX_QUEUED_RESPONSES: usize = 200;
+        let start = Instant::now();
+        let floor_at = start + floor;
+        let hard = start + max;
         let fd = self.evt.get_ref().as_raw_fd();
+        let mut inflight: i64 = 0;
+        let mut idle_since = start;
         loop {
             let now = Instant::now();
-            if now >= deadline {
+            if now >= hard {
                 return;
             }
-            // A complete message may already sit in the BufReader buffer (poll only
-            // sees the raw fd, not buffered bytes) — consume it without polling.
-            if self.evt.buffer().contains(&0u8) {
-                match self.read_message() {
-                    Ok(m) if m.get("method").is_some() => self.events.push(m),
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-                continue;
+            if now >= floor_at && inflight <= 0 && now.duration_since(idle_since) >= quiet {
+                return;
             }
-            let ms = (deadline - now).as_millis().min(100) as libc::c_int;
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            // SAFETY: single valid pollfd; poll does not retain the pointer.
-            let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-            if rc <= 0 {
-                continue; // timeout (quiet) or EINTR — keep waiting until the deadline
-            }
-            match self.read_message() {
-                Ok(m) if m.get("method").is_some() => self.events.push(m),
-                Ok(_) => {}
-                Err(_) => return, // pipe closed
+            match self.read_one(fd, 50) {
+                Ok(Some(m)) => match m.get("method").and_then(Value::as_str) {
+                    Some("Network.requestWillBeSent") => inflight += 1,
+                    Some("Network.loadingFinished") | Some("Network.loadingFailed") => {
+                        inflight -= 1;
+                        if inflight <= 0 {
+                            idle_since = Instant::now();
+                        }
+                    }
+                    Some("Network.responseReceived") => {
+                        if self.events.len() < MAX_QUEUED_RESPONSES {
+                            self.events.push(m);
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(None) => {}      // timeout — re-check idle/deadline
+                Err(_) => return,   // pipe closed
             }
         }
     }
@@ -522,12 +546,11 @@ pub fn cdp_render(
             .ok_or_else(|| err("no sessionId"))?
             .to_string();
 
-        // No Page/Runtime domain is enabled (they emit console/execution events);
-        // Network is enabled ONLY under the capture flag, and drain_for() keeps its
-        // per-request events drained so the pipe cannot fill.
-        if capture {
-            sess.call(Some(&sid), "Network.enable", json!({}))?;
-        }
+        // No Page/Runtime domain is enabled (they emit console/execution events).
+        // Network IS enabled — for network-idle settle (and, under the capture flag,
+        // response-body capture). drain_until_idle() keeps its per-request events
+        // drained so the pipe cannot fill and stall Chromium.
+        sess.call(Some(&sid), "Network.enable", json!({}))?;
         sess.call(
             Some(&sid),
             "Emulation.setDeviceMetricsOverride",
@@ -543,10 +566,14 @@ pub fn cdp_render(
 
         sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
 
-        // Bounded settle: let the page load through the proxy and paint. drain_for
-        // keeps the pipe empty (so an enabled Network domain can't stall Chromium)
-        // and collects Network events; the watchdog is the hard cap.
-        sess.drain_for(Duration::from_millis(settle as u64));
+        // Settle by network-idle, floored at `settle` (so delayed overlays still
+        // inject — no early-exit regression) and capped a few seconds later so slow
+        // SPAs get more load time without risking the watchdog deadline.
+        sess.drain_until_idle(
+            Duration::from_millis(settle as u64),
+            Duration::from_millis(settle as u64 + 3000),
+            Duration::from_millis(500),
+        );
         // Best-effort: wait for web fonts before capture (bounded by awaitPromise
         // + the watchdog). Ignore failure.
         let _ = sess.call(
