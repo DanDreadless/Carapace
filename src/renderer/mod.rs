@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cdp;
 pub mod proxy;
 
 use std::collections::HashMap;
