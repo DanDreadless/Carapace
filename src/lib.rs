@@ -267,24 +267,54 @@ fn browser_render(
         .unwrap_or(true);
     let page_host = base_url.host_str().unwrap_or("").to_string();
 
+    // CDP live render (CARAPACE-09 P0-b) — behind CARAPACE_CDP, default OFF. When
+    // enabled it is tried first; on success it also yields the post-JS DOM in the
+    // SAME session, so the separate dump_dom_live re-navigation below is skipped.
+    let cdp_enabled = std::env::var("CARAPACE_CDP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+    let mut cdp_dom: Option<String> = None;
+
     let mut screenshot_result: crate::error::Result<Vec<String>> =
         Err(crate::error::CarapaceError::Render("not rendered".into()));
     let mut render_mode = "offline";
 
     if live_enabled && !page_host.is_empty() {
-        match backend::render_to_png_live(
-            base_url.as_str(), &args.output, args.width, args.height, render_ua, &page_host, 0,
-        ) {
-            Ok(intercepted) => {
-                if backend::is_blank_screenshot(&args.output) {
-                    info!("live render blank ({:.1}% white) — falling back to offline render",
-                          backend::screenshot_blank_ratio(&args.output) * 100.0);
-                } else {
-                    screenshot_result = Ok(intercepted);
-                    render_mode = "live";
+        if cdp_enabled {
+            match crate::renderer::cdp::cdp_render(
+                base_url.as_str(), &args.output, args.width, args.height, render_ua, &page_host, 0,
+            ) {
+                Ok(out) => {
+                    if backend::is_blank_screenshot(&args.output) {
+                        info!("CDP live render blank ({:.1}% white) — falling back",
+                              backend::screenshot_blank_ratio(&args.output) * 100.0);
+                    } else {
+                        screenshot_result = Ok(out.intercepted);
+                        render_mode = "live_cdp";
+                        cdp_dom = Some(out.dom);
+                    }
                 }
+                Err(e) => info!("CDP live render failed ({}) — falling back", e),
             }
-            Err(e) => info!("live render failed ({}) — falling back to offline render", e),
+        }
+
+        // CLI live render (default path; also the fallback when CDP is enabled but
+        // failed/blanked).
+        if screenshot_result.is_err() {
+            match backend::render_to_png_live(
+                base_url.as_str(), &args.output, args.width, args.height, render_ua, &page_host, 0,
+            ) {
+                Ok(intercepted) => {
+                    if backend::is_blank_screenshot(&args.output) {
+                        info!("live render blank ({:.1}% white) — falling back to offline render",
+                              backend::screenshot_blank_ratio(&args.output) * 100.0);
+                    } else {
+                        screenshot_result = Ok(intercepted);
+                        render_mode = "live";
+                    }
+                }
+                Err(e) => info!("live render failed ({}) — falling back to offline render", e),
+            }
         }
     }
 
@@ -326,6 +356,12 @@ fn browser_render(
     // dump otherwise.
     let dumped_dom = if !screenshot_result.is_ok() {
         String::new()
+    } else if let Some(dom) = cdp_dom {
+        // CDP already captured the live post-JS DOM in the same session — no need
+        // for a second re-navigating dump_dom_live pass (P0-b consolidation).
+        const MAX_RENDERED_HTML: usize = 3 * 1024 * 1024;
+        report.rendered_html = dom.chars().take(MAX_RENDERED_HTML).collect();
+        dom
     } else if render_mode == "live" && !page_host.is_empty() {
         let live_dom = backend::dump_dom_live(base_url.as_str(), render_ua, &page_host, 0);
         if !live_dom.is_empty() {

@@ -26,7 +26,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,21 @@ use crate::error::{CarapaceError, Result};
 
 fn err(msg: impl Into<String>) -> CarapaceError {
     CarapaceError::Render(msg.into())
+}
+
+static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique, writable Chromium user-data dir under the tmpfs. Uniqueness is
+/// pid + wall-clock nanos + a process-wide counter, so concurrent renders never
+/// share a profile (a shared dir hits Chromium's SingletonLock and one instance
+/// exits immediately). Cf. `backend::ChromeProfile`.
+fn unique_profile_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = PROFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("carapace-cdp-{}-{}-{}", std::process::id(), nanos, seq))
 }
 
 /// Result of one spike render: the post-JS DOM, whether our injected bootstrap
@@ -89,7 +105,9 @@ impl CdpPipe {
     /// Launch Chromium with `--remote-debugging-pipe`, its own process group, and
     /// a private user-data-dir. fds 3/4 are wired to our pipes via a pre-exec fd
     /// shuffle that is collision-safe (sources are dup'd above fd 9 first).
-    fn launch(profile_dir: &std::path::Path) -> Result<Self> {
+    /// `extra_args` are appended after the base flags (e.g. `--proxy-server`,
+    /// `--user-agent`, `--window-size` for the production render).
+    fn launch(profile_dir: &std::path::Path, extra_args: &[&str]) -> Result<Self> {
         let bin = chromium_bin().ok_or_else(|| err("no chromium binary found"))?;
 
         let (cmd_r, cmd_w) = pipe_cloexec()?; // browser reads cmd_r on fd 3
@@ -109,6 +127,7 @@ impl CdpPipe {
             "--disable-background-networking",
             "--remote-debugging-pipe",
         ])
+        .args(extra_args)
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("about:blank")
         .stdin(Stdio::null())
@@ -240,12 +259,8 @@ impl CdpPipe {
 /// screenshot, then kill the process group. Returns Err (having killed the
 /// browser) on any timeout/failure.
 pub fn run_spike(navigate_url: &str, deadline: Duration) -> Result<SpikeOutput> {
-    let profile = std::env::temp_dir().join(format!(
-        "carapace-cdp-spike-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    let mut sess = CdpPipe::launch(&profile)?;
+    let profile = unique_profile_dir();
+    let mut sess = CdpPipe::launch(&profile, &[])?;
 
     // F4: watchdog kills the process group at the deadline regardless of what the
     // page does; a blocked read then errors out, unwinding this function.
@@ -341,6 +356,206 @@ pub fn run_spike(navigate_url: &str, deadline: Duration) -> Result<SpikeOutput> 
     result
 }
 
+/// Output of a production CDP live render: the refused cross-origin URLs (from
+/// the SSRF policy proxy) and the post-JS DOM. The screenshot is written to the
+/// caller's `output_path`.
+pub struct CdpRenderOutput {
+    pub intercepted: Vec<String>,
+    pub dom: String,
+}
+
+/// Max full-page capture height, matching the CLI path's sentinel.
+const FULL_PAGE_SENTINEL_H: u32 = 8000;
+/// Cap the returned DOM, matching `lib.rs` `MAX_RENDERED_HTML`.
+const MAX_DOM_BYTES: usize = 3 * 1024 * 1024;
+
+/// Spawn the hard-deadline watchdog: it `killpg`s the browser's own process group
+/// (F4) unless `done` is set first. Returns the flag to set on clean completion.
+fn spawn_watchdog(pgid: i32, deadline: Duration) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let d2 = done.clone();
+    let handle = std::thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if d2.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !d2.load(Ordering::Relaxed) {
+            // SAFETY: pgid is the browser's own process group.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    });
+    (done, handle)
+}
+
+/// **Production CDP live render** (CARAPACE-09 P0-b, Phases 3–4) — the CDP
+/// equivalent of `backend::render_to_png_live` + `backend::dump_dom_live`, in ONE
+/// browser session. Behind the `CARAPACE_CDP` flag; the CLI path remains the
+/// default and the fallback.
+///
+/// Security posture (see the plan's §4): the browser routes **all** network
+/// through the SSRF `PolicyProxy` (`--proxy-server`) exactly as the CLI path does
+/// (F1 — CDP is control-plane only; no CDP request interception/continue is used).
+/// The DevTools channel is a pipe, not a port (F2). A watchdog enforces the hard
+/// deadline by process-group kill (F4). A fresh browser process + private profile
+/// per render gives isolation (F7). The **live-variant** bootstrap
+/// (`IDENTITY_NAV_BOOTSTRAP`) spoofs Win32 + suppresses navigation/refresh but
+/// keeps real same-origin `fetch` (F8).
+///
+/// No event domains are enabled — only request/response commands cross the pipe —
+/// so an adversarial page cannot flood the control channel. Settling is a bounded
+/// fixed sleep after navigate (network-idle event-counting is a later refinement).
+/// Returns Err (browser killed) on any failure so the caller falls back offline.
+pub fn cdp_render(
+    url: &str,
+    output_path: &std::path::Path,
+    width: u32,
+    height: u32, // 0 = full page
+    ua: &str,
+    page_host: &str,
+    settle_ms: u32, // 0 = default 5000
+) -> Result<CdpRenderOutput> {
+    use crate::renderer::backend::CDN_PROXY_BYPASS;
+    use crate::renderer::bootstrap::IDENTITY_NAV_BOOTSTRAP;
+    use crate::renderer::proxy::{PolicyProxy, RenderPolicy};
+
+    let full_page = height == 0;
+    let render_h = if full_page { FULL_PAGE_SENTINEL_H } else { height };
+    let settle = if settle_ms == 0 { 5000 } else { settle_ms };
+    // Hard wall-clock deadline: settle + slack for launch/navigate/capture.
+    let deadline = Duration::from_millis(settle as u64 + 6000);
+
+    // Same-origin SSRF-enforcing forwarding proxy as the CLI live path.
+    let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
+    let proxy_arg = proxy.proxy_arg();
+    let ua_arg = format!("--user-agent={ua}");
+    let win_arg = format!("--window-size={width},{render_h}");
+    let extra: Vec<&str> = vec![
+        &proxy_arg,
+        &ua_arg,
+        &win_arg,
+        "--force-color-profile=srgb",
+        "--run-all-compositor-stages-before-draw",
+        "--disable-blink-features=AutomationControlled",
+    ];
+
+    let profile = unique_profile_dir();
+
+    let mut sess = match CdpPipe::launch(&profile, &extra) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = proxy.collect();
+            let _ = std::fs::remove_dir_all(&profile);
+            return Err(e);
+        }
+    };
+    let (done, watchdog) = spawn_watchdog(sess.pgid, deadline);
+
+    let result = (|| -> Result<String> {
+        let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+        let target_id = created
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("no targetId"))?
+            .to_string();
+        let attached = sess.call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )?;
+        let sid = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("no sessionId"))?
+            .to_string();
+
+        // No Page/Runtime/Network domain is enabled: only command responses cross
+        // the pipe, so a page emitting console/network events cannot flood it.
+        sess.call(
+            Some(&sid),
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": width, "height": render_h, "deviceScaleFactor": 1, "mobile": false }),
+        )?;
+        // Live-variant bootstrap (identity + nav/refresh suppression, NO fetch mock),
+        // registered before navigation so it runs at document-start.
+        sess.call(
+            Some(&sid),
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": IDENTITY_NAV_BOOTSTRAP }),
+        )?;
+
+        sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
+
+        // Bounded settle: let the page load through the proxy and paint. Fixed
+        // sleep (network-idle event-counting is a later refinement); the watchdog
+        // is the hard cap. Events buffer harmlessly since no domain is enabled.
+        std::thread::sleep(Duration::from_millis(settle as u64));
+        // Best-effort: wait for web fonts before capture (bounded by awaitPromise
+        // + the watchdog). Ignore failure.
+        let _ = sess.call(
+            Some(&sid),
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.fonts && document.fonts.ready ? document.fonts.ready.then(function(){return true;}) : true",
+                "awaitPromise": true,
+                "returnByValue": true
+            }),
+        );
+
+        // Screenshot: full-page via captureBeyondViewport + content height, else viewport.
+        let shot_params = if full_page {
+            let content_h = sess
+                .call(Some(&sid), "Page.getLayoutMetrics", json!({}))
+                .ok()
+                .and_then(|m| m.pointer("/cssContentSize/height").and_then(Value::as_f64))
+                .unwrap_or(render_h as f64)
+                .clamp(1.0, FULL_PAGE_SENTINEL_H as f64);
+            json!({
+                "format": "png",
+                "captureBeyondViewport": true,
+                "clip": { "x": 0, "y": 0, "width": width as f64, "height": content_h, "scale": 1 }
+            })
+        } else {
+            json!({ "format": "png" })
+        };
+        let shot = sess.call(Some(&sid), "Page.captureScreenshot", shot_params)?;
+        let png = shot
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            .ok_or_else(|| err("no screenshot data"))?;
+        std::fs::write(output_path, &png).map_err(|e| err(format!("write screenshot: {e}")))?;
+
+        let dom = sess
+            .call(
+                Some(&sid),
+                "Runtime.evaluate",
+                json!({ "expression": "document.documentElement.outerHTML", "returnByValue": true }),
+            )?
+            .pointer("/result/value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(MAX_DOM_BYTES)
+            .collect::<String>();
+
+        Ok(dom)
+    })();
+
+    done.store(true, Ordering::Relaxed);
+    let _ = sess.call(None, "Browser.close", json!({}));
+    sess.kill();
+    let _ = watchdog.join();
+    let _ = std::fs::remove_dir_all(&profile);
+    let intercepted = proxy.collect();
+
+    result.map(|dom| CdpRenderOutput { intercepted, dom })
+}
+
 #[cfg(test)]
 mod cdp_spike_tests {
     use super::*;
@@ -356,6 +571,25 @@ mod cdp_spike_tests {
         assert!(out.dom.contains("SPIKE_OK"), "post-JS DOM captured: {}", out.dom);
         assert!(out.bootstrap_ran, "addScriptToEvaluateOnNewDocument ran before page scripts");
         assert!(out.screenshot_len > 0, "non-empty screenshot captured");
+    }
+
+    #[test]
+    fn cdp_render_writes_screenshot_and_captures_dom() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping cdp_render test: no chromium on this host");
+            return;
+        }
+        let out_path =
+            unique_profile_dir().with_extension("png"); // unique path, not a real profile
+        let url = "data:text/html,<html><head><title>T</title></head>\
+                   <body><h1>CDP_RENDER_OK</h1></body></html>";
+        // Fixed 800x600 viewport; page_host empty (data: URL has no host, no proxy traffic).
+        let out = cdp_render(url, &out_path, 800, 600, crate::renderer::backend::WINDOWS_UA, "", 500)
+            .expect("cdp_render");
+        assert!(out.dom.contains("CDP_RENDER_OK"), "post-JS DOM captured: {}", out.dom);
+        let len = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        assert!(len > 0, "non-empty screenshot written to file");
+        let _ = std::fs::remove_file(&out_path);
     }
 
     #[test]
