@@ -295,6 +295,7 @@ fn browser_render(
                         report.runtime_scripts = out.runtime_scripts.into_iter()
                             .map(|(url, body)| crate::threat::RuntimeScript { url, body })
                             .collect();
+                        report.nav_targets = out.nav_targets;
                     }
                 }
                 Err(e) => info!("CDP live render failed ({}) — falling back", e),

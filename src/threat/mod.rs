@@ -209,6 +209,14 @@ pub struct ThreatReport {
     #[serde(default)]
     pub runtime_scripts: Vec<RuntimeScript>,
 
+    /// Attempted main-frame redirect destinations captured (and blocked) by the CDP
+    /// `Fetch` Document-only interception — JS-COMPUTED interstitial/TDS destinations
+    /// no static regex can resolve. Bounded (≤10). Populated only under
+    /// `CARAPACE_CDP_NAV_CAPTURE`; the caller SSRF-validates + sub-scans them.
+    /// (CARAPACE-16)
+    #[serde(default)]
+    pub nav_targets: Vec<String>,
+
     html_flags: Vec<HtmlFlag>,
     js_flags: Vec<JsFlag>,
     blocked_network: Vec<String>,
@@ -232,6 +240,7 @@ impl ThreatReport {
             normalized_scripts: Vec::new(),
             decoded_payloads: Vec::new(),
             runtime_scripts: Vec::new(),
+            nav_targets: Vec::new(),
             html_flags: Vec::new(),
             js_flags: Vec::new(),
             blocked_network: Vec::new(),

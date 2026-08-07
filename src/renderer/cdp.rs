@@ -64,6 +64,20 @@ pub struct SpikeOutput {
     pub screenshot_len: usize,
 }
 
+/// CARAPACE-16 nav-capture latch state, threaded through the settle drain. The
+/// FIRST non-`about:` Document request is the initial (already SSRF-validated)
+/// navigation → continued. Every SUBSEQUENT Document request is a client-side
+/// redirect → its URL is recorded (bounded) and the request is FAILED — never
+/// continued, never dispatched to the destination. Because the only interception
+/// `continueRequest` is this first-Document slot, "only the validated navigation is
+/// continued" is a structural property (plan §4-A). Non-Document / `about:` pauses
+/// are continued without consuming the latch (never block a subresource).
+struct NavCapture {
+    sid: String,
+    first_doc: bool,
+    targets: Vec<String>,
+}
+
 fn chromium_bin() -> Option<&'static str> {
     for n in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
         if Command::new("which")
@@ -267,7 +281,13 @@ impl CdpPipe {
     /// Requires `Network.enable`; with Network off there are no events so it simply
     /// waits `floor`. Only `Network.responseReceived` events are queued (for the
     /// optional body capture), capped; request/finished are counted inline.
-    fn drain_until_idle(&mut self, floor: Duration, max: Duration, quiet: Duration) {
+    fn drain_until_idle(
+        &mut self,
+        floor: Duration,
+        max: Duration,
+        quiet: Duration,
+        mut nav: Option<&mut NavCapture>,
+    ) {
         const MAX_QUEUED_RESPONSES: usize = 200;
         let start = Instant::now();
         let floor_at = start + floor;
@@ -297,11 +317,81 @@ impl CdpPipe {
                             self.events.push(m);
                         }
                     }
+                    // CARAPACE-16: a paused navigation MUST be answered inline or
+                    // Chromium stalls (F-A2). With Fetch enabled (nav capture on)
+                    // this is the initial nav (continue) or a redirect (capture+fail).
+                    Some("Fetch.requestPaused") => {
+                        if let Some(nc) = nav.as_deref_mut() {
+                            self.handle_fetch_pause(&m, nc);
+                        }
+                    }
                     _ => {}
                 },
                 Ok(None) => {}      // timeout — re-check idle/deadline
                 Err(_) => return,   // pipe closed
             }
+        }
+    }
+
+    /// Fire-and-forget CDP command (no response wait). Used to answer
+    /// `Fetch.requestPaused` from inside the drain loop — a blocking `call()` there
+    /// would deadlock (its response can't arrive until the pause is answered), and to
+    /// send `Page.navigate` on the capture path (its ack won't come until the initial
+    /// Document pause is continued).
+    fn send_cmd(&mut self, session: &str, method: &str, params: Value) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({ "id": id, "method": method, "params": params, "sessionId": session });
+        if let Ok(mut bytes) = serde_json::to_vec(&msg) {
+            bytes.push(0);
+            let _ = self.cmd.write_all(&bytes).and_then(|_| self.cmd.flush());
+        }
+    }
+
+    /// Answer one `Fetch.requestPaused` per the NavCapture latch (see [`NavCapture`]).
+    /// The internal-host guarantee lives here: a redirect to any host — including an
+    /// internal one — takes the capture+FAIL branch, never the continue branch, so it
+    /// is surfaced for the caller's SSRF re-validation but never dispatched (plan
+    /// §4-A / F1 guard test).
+    fn handle_fetch_pause(&mut self, m: &Value, nc: &mut NavCapture) {
+        let p = m.get("params");
+        let rid = p
+            .and_then(|p| p.get("requestId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if rid.is_empty() {
+            return;
+        }
+        let rtype = p.and_then(|p| p.get("resourceType")).and_then(Value::as_str).unwrap_or("");
+        let rurl = p
+            .and_then(|p| p.pointer("/request/url"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // about:blank / any non-Document pause: continue WITHOUT consuming the latch
+        // and never block a subresource (fail-open on the render; the proxy is still
+        // the gate). With the Document-only Fetch filter, non-Document should not
+        // pause, but this is the defensive default.
+        if rurl.starts_with("about:") || rtype != "Document" {
+            self.send_cmd(&nc.sid, "Fetch.continueRequest", json!({ "requestId": rid }));
+            return;
+        }
+        if nc.first_doc {
+            nc.first_doc = false;
+            self.send_cmd(&nc.sid, "Fetch.continueRequest", json!({ "requestId": rid }));
+        } else {
+            // Redirect: record (bounded, deduped) + block. Nothing is dispatched to
+            // the destination; the caller SSRF-validates before any fetch.
+            let t: String = rurl.chars().take(2048).collect();
+            if nc.targets.len() < 10 && !nc.targets.contains(&t) {
+                nc.targets.push(t);
+            }
+            self.send_cmd(
+                &nc.sid,
+                "Fetch.failRequest",
+                json!({ "requestId": rid, "errorReason": "Aborted" }),
+            );
         }
     }
 
@@ -428,6 +518,12 @@ pub struct CdpRenderOutput {
     /// unless `CARAPACE_CDP_CAPTURE` is enabled. Covers scripts loaded via
     /// `fetch()+eval` / dynamic `import()` that never appear as `<script>` tags.
     pub runtime_scripts: Vec<(String, String)>,
+    /// Attempted MAIN-FRAME redirect destinations captured (and blocked) via CDP
+    /// `Fetch` Document-only interception — JS-COMPUTED interstitial/TDS destinations
+    /// no static regex or single-session event-observation can resolve. Bounded
+    /// (≤10). Empty unless `CARAPACE_CDP_NAV_CAPTURE` is enabled. The caller
+    /// SSRF-validates + sub-scans them. (CARAPACE-16)
+    pub nav_targets: Vec<String>,
 }
 
 /// Max full-page capture height, matching the CLI path's sentinel.
@@ -502,6 +598,14 @@ pub fn cdp_render(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
         .unwrap_or(false);
 
+    // CARAPACE-16: capture JS-computed main-frame redirect destinations via CDP
+    // Fetch Document-only interception. Default OFF — it enables the Fetch domain
+    // (request interception) so it bakes behind this flag before affecting the
+    // default render path.
+    let nav_capture = std::env::var("CARAPACE_CDP_NAV_CAPTURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+
     // Same-origin SSRF-enforcing forwarding proxy as the CLI live path.
     let proxy = PolicyProxy::start(RenderPolicy::new(page_host, CDN_PROXY_BYPASS));
     let proxy_arg = proxy.proxy_arg();
@@ -528,7 +632,7 @@ pub fn cdp_render(
     };
     let (done, watchdog) = spawn_watchdog(sess.pgid, deadline);
 
-    let result = (|| -> Result<(String, Vec<(String, String)>)> {
+    let result = (|| -> Result<(String, Vec<(String, String)>, Vec<String>)> {
         let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
         let target_id = created
             .get("targetId")
@@ -564,15 +668,42 @@ pub fn cdp_render(
             json!({ "source": IDENTITY_NAV_BOOTSTRAP }),
         )?;
 
-        sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
+        // CARAPACE-16 nav capture: intercept ONLY top-level Document requests so
+        // subresources still flow through the proxy untouched (F-A1). The latch in
+        // drain_until_idle continues the first (validated) nav and captures+fails
+        // any redirect.
+        let mut navcap = if nav_capture {
+            sess.call(
+                Some(&sid),
+                "Fetch.enable",
+                json!({ "patterns": [ {
+                    "urlPattern": "*", "requestStage": "Request", "resourceType": "Document"
+                } ] }),
+            )?;
+            Some(NavCapture { sid: sid.clone(), first_doc: true, targets: Vec::new() })
+        } else {
+            None
+        };
+
+        // Navigate. With Fetch on we MUST fire-and-forget: Page.navigate would not
+        // ack until the initial Document pause is continued, but that happens inside
+        // the drain loop below — a blocking call() here would deadlock.
+        if nav_capture {
+            sess.send_cmd(&sid, "Page.navigate", json!({ "url": url }));
+        } else {
+            sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
+        }
 
         // Settle by network-idle, floored at `settle` (so delayed overlays still
         // inject — no early-exit regression) and capped a few seconds later so slow
-        // SPAs get more load time without risking the watchdog deadline.
+        // SPAs get more load time without risking the watchdog deadline. On the
+        // capture path the loop also answers each Fetch pause (initial → continue,
+        // redirect → capture+fail).
         sess.drain_until_idle(
             Duration::from_millis(settle as u64),
             Duration::from_millis(settle as u64 + 3000),
             Duration::from_millis(500),
+            navcap.as_mut(),
         );
         // Best-effort: wait for web fonts before capture (bounded by awaitPromise
         // + the watchdog). Ignore failure.
@@ -661,7 +792,8 @@ pub fn cdp_render(
             }
         }
 
-        Ok((dom, runtime_scripts))
+        let nav_targets = navcap.map(|n| n.targets).unwrap_or_default();
+        Ok((dom, runtime_scripts, nav_targets))
     })();
 
     done.store(true, Ordering::Relaxed);
@@ -671,7 +803,12 @@ pub fn cdp_render(
     let _ = std::fs::remove_dir_all(&profile);
     let intercepted = proxy.collect();
 
-    result.map(|(dom, runtime_scripts)| CdpRenderOutput { intercepted, dom, runtime_scripts })
+    result.map(|(dom, runtime_scripts, nav_targets)| CdpRenderOutput {
+        intercepted,
+        dom,
+        runtime_scripts,
+        nav_targets,
+    })
 }
 
 #[cfg(test)]
@@ -854,5 +991,70 @@ mod cdp_spike_tests {
         // (c) F-A2: inline-answering every pause did not stall the pipe — the DOM
         // is still readable after interception.
         assert!(!dom.is_empty(), "render completed after interception — no pipe stall");
+    }
+
+    /// CARAPACE-16 F1 guard (§6.3). Exercises the PRODUCTION path
+    /// (`drain_until_idle` + `handle_fetch_pause` + `NavCapture`): a main-frame
+    /// redirect to an SSRF target must be CAPTURED + FAILED, never continued. The
+    /// assertion is structural — a URL can only enter `targets` via the fail+record
+    /// branch, so its presence proves the internal host was never `continueRequest`'d.
+    /// The caller (`tasks.py` Step 4d.7) then rejects it via `validate_url()` before
+    /// any fetch; here we prove Carapace never dispatched it.
+    ///
+    /// `first_doc` is primed **false** to model the post-initial-navigation state: in
+    /// production the initial http(s) scan URL emits the first Document pause and is
+    /// continued (consuming the slot), so a redirect is always a *subsequent*
+    /// Document. A `data:` initial (as used here for hermeticism) does NOT emit a
+    /// Fetch pause, so priming `first_doc=false` faithfully isolates the redirect-fail
+    /// path this guard is about — the "first Document is continued" half is proven by
+    /// `spike_fetch_document_interception_captures_computed_dest`.
+    #[test]
+    fn f1_internal_host_redirect_is_captured_not_continued() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping F1 guard test: no chromium on this host");
+            return;
+        }
+        let profile = unique_profile_dir();
+        let mut sess = CdpPipe::launch(&profile, &[]).expect("launch");
+        let (done, watchdog) = spawn_watchdog(sess.pgid, Duration::from_secs(10));
+        let url = "data:text/html,<html><body>gate\
+                   <script>location.replace('http://169.254.169.254/latest/meta-data/');</script>\
+                   </body></html>";
+
+        let targets = (|| -> Result<Vec<String>> {
+            let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+            let tid = created.get("targetId").and_then(Value::as_str)
+                .ok_or_else(|| err("no targetId"))?.to_string();
+            let attached = sess.call(None, "Target.attachToTarget",
+                json!({ "targetId": tid, "flatten": true }))?;
+            let sid = attached.get("sessionId").and_then(Value::as_str)
+                .ok_or_else(|| err("no sessionId"))?.to_string();
+            sess.call(Some(&sid), "Network.enable", json!({}))?;
+            sess.call(Some(&sid), "Fetch.enable", json!({
+                "patterns": [ { "urlPattern": "*", "requestStage": "Request", "resourceType": "Document" } ]
+            }))?;
+            // first_doc:false — the validated initial nav is modelled as already done.
+            let mut navcap = NavCapture { sid: sid.clone(), first_doc: false, targets: Vec::new() };
+            sess.send_cmd(&sid, "Page.navigate", json!({ "url": url }));
+            sess.drain_until_idle(
+                Duration::from_millis(800),
+                Duration::from_millis(3000),
+                Duration::from_millis(400),
+                Some(&mut navcap),
+            );
+            Ok(navcap.targets)
+        })();
+
+        done.store(true, Ordering::Relaxed);
+        let _ = sess.call(None, "Browser.close", json!({}));
+        sess.kill();
+        let _ = watchdog.join();
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let targets = targets.expect("guard render");
+        assert!(
+            targets.iter().any(|u| u.contains("169.254.169.254")),
+            "internal-host redirect captured+failed (never continued); targets: {:?}", targets
+        );
     }
 }
