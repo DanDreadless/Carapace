@@ -238,6 +238,30 @@ const DEOBF_PREAMBLE: &str = r#"(function(){
   try{ var _u=globalThis.unescape; globalThis.unescape=function(s){ var r=s; try{r=_u?_u(s):s}catch(e){} rec('unescape', r); return r; }; }catch(e){}
   try{ var _d=globalThis.decodeURIComponent; globalThis.decodeURIComponent=function(s){ var r=s; try{r=_d(s)}catch(e){} rec('decodeURIComponent', r); return r; }; }catch(e){}
   try{ if(globalThis.document){ globalThis.document.write=function(h){ rec('document.write', h); }; globalThis.document.writeln=function(h){ rec('document.write', h); }; } }catch(e){}
+  // DOM-injection sinks (CARAPACE-10): ghost code / decoders write the recovered
+  // HTML to innerHTML/outerHTML/insertAdjacentHTML, not just document.write. Return a
+  // fake element from the DOM lookups whose HTML setters record the injected markup so
+  // an atob/XOR-decoded phishing DOM is captured for re-analysis.
+  try{
+    var _mkEl = function(){
+      var el = {};
+      try{ Object.defineProperty(el,'innerHTML',{set:function(h){rec('innerHTML',String(h));},get:function(){return '';},configurable:true}); }catch(e){}
+      try{ Object.defineProperty(el,'outerHTML',{set:function(h){rec('outerHTML',String(h));},get:function(){return '';},configurable:true}); }catch(e){}
+      el.insertAdjacentHTML=function(pos,h){ rec('insertAdjacentHTML',String(h)); };
+      el.appendChild=function(c){ return c; };
+      el.append=function(){}; el.setAttribute=function(){}; el.addEventListener=function(){};
+      el.style={}; el.classList={add:function(){},remove:function(){}};
+      return el;
+    };
+    if(globalThis.document){
+      globalThis.document.getElementById=function(){ return _mkEl(); };
+      globalThis.document.querySelector=function(){ return _mkEl(); };
+      globalThis.document.querySelectorAll=function(){ return []; };
+      globalThis.document.createElement=function(){ return _mkEl(); };
+      try{ Object.defineProperty(globalThis.document,'body',{get:function(){return _mkEl();},configurable:true}); }catch(e){}
+      try{ Object.defineProperty(globalThis.document,'documentElement',{get:function(){return _mkEl();},configurable:true}); }catch(e){}
+    }
+  }catch(e){}
   try{ globalThis.setTimeout=function(f){ if(typeof f==='string') rec('setTimeout', f); return 0; }; }catch(e){}
   try{ globalThis.setInterval=function(f){ if(typeof f==='string') rec('setInterval', f); return 0; }; }catch(e){}
 })();"#;
@@ -770,6 +794,23 @@ mod deobf_tests {
     fn captures_document_write_unescape() {
         let caps = capture(r#"document.write(unescape("%3Cscript%3Ealert(1)%3C/script%3E"));"#);
         assert!(has(&caps, "document.write", "<script>"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn captures_innerhtml_dom_injection() {
+        // CARAPACE-10: a decoded phishing DOM written to innerHTML (not document.write)
+        // must be captured. unescape is hooked to return the real decoded HTML.
+        let caps = capture(
+            r#"document.getElementById('app').innerHTML = unescape("%3Cform%3E%3Cinput%20type%3Dpassword%3E%3C/form%3E");"#,
+        );
+        assert!(has(&caps, "innerHTML", "<form>"), "caps: {:?}", caps);
+        assert!(has(&caps, "innerHTML", "type=password"), "caps: {:?}", caps);
+    }
+
+    #[test]
+    fn captures_insert_adjacent_html() {
+        let caps = capture(r#"document.body.insertAdjacentHTML('beforeend', "<div id=lure>phish</div>");"#);
+        assert!(has(&caps, "insertAdjacentHTML", "<div id=lure>phish</div>"), "caps: {:?}", caps);
     }
 
     #[test]
