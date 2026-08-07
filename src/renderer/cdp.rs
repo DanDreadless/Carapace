@@ -725,4 +725,134 @@ mod cdp_spike_tests {
         assert!(res.is_err(), "hung page must fail, not hang forever");
         assert!(elapsed < Duration::from_secs(8), "must be killed near the 2s deadline, took {elapsed:?}");
     }
+
+    /// Fire-and-forget CDP command (no response wait) — used to answer
+    /// `Fetch.requestPaused` from inside the read loop without the `call()`
+    /// reentrancy that would re-enter the pipe while a pause is outstanding.
+    fn send_cmd(sess: &mut CdpPipe, session: &str, method: &str, params: Value) {
+        let id = sess.next_id;
+        sess.next_id += 1;
+        let msg = json!({ "id": id, "method": method, "params": params, "sessionId": session });
+        if let Ok(mut bytes) = serde_json::to_vec(&msg) {
+            bytes.push(0);
+            let _ = sess.cmd.write_all(&bytes).and_then(|_| sess.cmd.flush());
+        }
+    }
+
+    /// CARAPACE-16 Phase-1 spike (no production wiring). Proves the mechanism the
+    /// plan (`docs/research-carapace16-nav-capture-2026.md`) hinges on, before the
+    /// §5 decisions are locked:
+    ///   (a) F-A1 — CDP `Fetch` scoped to `resourceType: "Document"` pauses ONLY
+    ///       main-frame navigations, never subresources (the `<img>` here);
+    ///   (b) a positional continue-first / fail-rest latch captures a JS-COMPUTED
+    ///       redirect destination (`base + "landing?id=" + (20+22)`) — the latch
+    ///       blocks the redirect rather than continuing it;
+    ///   (c) every paused request is answered inline — no pipe stall (F-A2), so the
+    ///       DOM is still readable after interception.
+    /// Finding (see inline note): blocking a committed main-frame nav cannot keep the
+    /// screenshot on the interstitial (error/blank post-nav state) — but that is no
+    /// regression and the destination capture, the actual goal, is unaffected.
+    /// about:blank is continued without consuming the latch (it has no network load,
+    /// but Chromium's target-bootstrap could still surface it).
+    #[test]
+    fn spike_fetch_document_interception_captures_computed_dest() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping Fetch-interception spike: no chromium on this host");
+            return;
+        }
+        let profile = unique_profile_dir();
+        let mut sess = CdpPipe::launch(&profile, &[]).expect("launch");
+        let (done, watchdog) = spawn_watchdog(sess.pgid, Duration::from_secs(10));
+
+        let url = "data:text/html,<html><head><title>Redirecting</title></head>\
+                   <body><h1>INTERSTITIAL</h1>\
+                   <img src=\"https://img.example.test/pixel.png\">\
+                   <script>setTimeout(function(){var b=\"https://evil.example.test/\";\
+                   var t=\"landing?id=\"+(20+22);location.replace(b+t);},250);</script>\
+                   </body></html>";
+
+        let result = (|| -> Result<(Vec<String>, Vec<String>, String)> {
+            let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+            let target_id = created.get("targetId").and_then(Value::as_str)
+                .ok_or_else(|| err("no targetId"))?.to_string();
+            let attached = sess.call(None, "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }))?;
+            let sid = attached.get("sessionId").and_then(Value::as_str)
+                .ok_or_else(|| err("no sessionId"))?.to_string();
+
+            // Document-only interception at the Request stage.
+            sess.call(Some(&sid), "Fetch.enable", json!({
+                "patterns": [ { "urlPattern": "*", "requestStage": "Request", "resourceType": "Document" } ]
+            }))?;
+            sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
+
+            let fd = sess.evt.get_ref().as_raw_fd();
+            let settle = Instant::now() + Duration::from_millis(2500);
+            let mut first_doc = true;
+            let mut paused_types: Vec<String> = Vec::new();
+            let mut captured: Vec<String> = Vec::new();
+            while Instant::now() < settle {
+                match sess.read_one(fd, 100) {
+                    Ok(Some(m)) => {
+                        if m.get("method").and_then(Value::as_str) != Some("Fetch.requestPaused") {
+                            continue;
+                        }
+                        let p = m.get("params").cloned().unwrap_or(Value::Null);
+                        let rid = p.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
+                        let rtype = p.get("resourceType").and_then(Value::as_str).unwrap_or("").to_string();
+                        let rurl = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("").to_string();
+                        if rurl.starts_with("about:") {
+                            send_cmd(&mut sess, &sid, "Fetch.continueRequest", json!({ "requestId": rid }));
+                            continue;
+                        }
+                        paused_types.push(rtype);
+                        if first_doc {
+                            first_doc = false;
+                            send_cmd(&mut sess, &sid, "Fetch.continueRequest", json!({ "requestId": rid }));
+                        } else {
+                            captured.push(rurl);
+                            // Block the redirect (nothing dispatched to the destination —
+                            // F1-safe). Finding: neither failRequest nor a synthetic 204
+                            // fulfil keeps the frame on the interstitial — a committed
+                            // main-frame nav that is then blocked shows Chromium's post-nav
+                            // (error/blank) state. No regression: today a refused
+                            // cross-origin nav is already blank. Capture is the goal.
+                            send_cmd(&mut sess, &sid, "Fetch.failRequest",
+                                json!({ "requestId": rid, "errorReason": "Aborted" }));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+
+            let dom = sess.call(Some(&sid), "Runtime.evaluate",
+                json!({ "expression": "document.documentElement.outerHTML", "returnByValue": true }))
+                .ok()
+                .and_then(|r| r.pointer("/result/value").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            Ok((paused_types, captured, dom))
+        })();
+
+        done.store(true, Ordering::Relaxed);
+        let _ = sess.call(None, "Browser.close", json!({}));
+        sess.kill();
+        let _ = watchdog.join();
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let (paused_types, captured, dom) = result.expect("spike render");
+        // (b) JS-COMPUTED destination captured.
+        assert!(
+            captured.iter().any(|u| u == "https://evil.example.test/landing?id=42"),
+            "computed redirect destination captured; saw: {:?}", captured
+        );
+        // (a) F-A1: only Document requests were intercepted — the <img> was not.
+        assert!(
+            !paused_types.is_empty() && paused_types.iter().all(|t| t == "Document"),
+            "only Document requests intercepted (F-A1); saw: {:?}", paused_types
+        );
+        // (c) F-A2: inline-answering every pause did not stall the pipe — the DOM
+        // is still readable after interception.
+        assert!(!dom.is_empty(), "render completed after interception — no pipe stall");
+    }
 }
