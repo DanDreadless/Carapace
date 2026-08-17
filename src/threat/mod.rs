@@ -64,8 +64,10 @@ pub enum JsFlag {
     HexObfuscation(DecodedString),
     TimerWithString { timer: String, code: String, loc: CodeLocation },
     /// Script is probing for headless/automated browser environment.
-    /// Technique values: `webdriver_check`, `headless_string_probe`,
-    /// `screen_dimension_probe`, `plugins_probe`.
+    /// Technique values: `webdriver_check`, `webdriver_check_ungated`,
+    /// `headless_string_probe`, `screen_dimension_probe`, `plugins_probe`.
+    /// `webdriver_check` means the probe gates a content-delivery sink (cloaking);
+    /// `webdriver_check_ungated` means it does not (context signal only).
     SandboxEvasion { technique: String, detail: String, loc: CodeLocation },
     /// Fake-CAPTCHA / ClickFix clipboard hijack: JS wrote a string to the
     /// system clipboard via `navigator.clipboard.writeText` or a `copy`
@@ -394,6 +396,11 @@ impl ThreatReport {
             JsFlag::SandboxEvasion { technique, detail, .. } => {
                 let (severity, code) = match technique.as_str() {
                     "webdriver_check"            => (Severity::High,   "SANDBOX_EVASION_WEBDRIVER"),
+                    // Reading the property gates nothing here: no legitimate-vs-scanner
+                    // content difference was observed, so the cloaking claim is unsupported.
+                    // LOW keeps it as analyst context and lets context-collapse escalate it
+                    // on disposable infrastructure, without carrying a verdict alone.
+                    "webdriver_check_ungated"    => (Severity::Low,    "SANDBOX_EVASION_WEBDRIVER_UNGATED"),
                     "headless_string_probe"      => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
                     "screen_dimension_probe"     => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
                     "plugins_probe"              => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
@@ -647,6 +654,7 @@ impl ThreatReport {
                 JsFlag::TimerWithString { .. } => "TIMER_STRING_EXEC",
                 JsFlag::SandboxEvasion { technique, .. } => match technique.as_str() {
                     "webdriver_check"            => "SANDBOX_EVASION_WEBDRIVER",
+                    "webdriver_check_ungated"    => "SANDBOX_EVASION_WEBDRIVER_UNGATED",
                     "headless_string_probe"      => "SANDBOX_EVASION_HEADLESS_STRING",
                     "screen_dimension_probe"     => "SANDBOX_EVASION_SCREEN_PROBE",
                     "plugins_probe"              => "SANDBOX_EVASION_PLUGINS_PROBE",

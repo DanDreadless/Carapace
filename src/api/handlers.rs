@@ -226,8 +226,16 @@ pub async fn render(
         };
 
         // Read the desktop screenshot.  For json format the output is in `report` itself.
+        //
+        // `render_skipped` means the content-type gate in `lib::run()` bypassed the whole
+        // render pipeline (non-HTML body), so no PNG was ever written.  Reading it
+        // unconditionally turned every such request into ENOENT -> HTTP 500, which threw
+        // away the threat report the static analyser had *already* produced: Insight lost
+        // its entire renderer phase for any non-HTML URL.  Found while triaging a ClickFix
+        // stage-2 endpoint that served PowerShell as `text/plain` (Insight case 270).
         let file_bytes = match fmt_for_closure {
             OutputFormat::Json => None,
+            OutputFormat::Png if report.render_skipped => None,
             OutputFormat::Png => Some(
                 std::fs::read(&path_for_closure)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
