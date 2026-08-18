@@ -288,6 +288,30 @@ fn browser_render(
     // CDP live render (CARAPACE-09 P0-b) — behind CARAPACE_CDP, default OFF. When
     // enabled it is tried first; on success it also yields the post-JS DOM in the
     // SAME session, so the separate dump_dom_live re-navigation below is skipped.
+    // Whole-ladder wall-clock budget (2026-08-18). The fallback chain below can launch
+    // Chromium FOUR times — CDP live, CLI live, offline, offline-with-longer-settle —
+    // and nothing bounded it as a unit. A page that renders blank in every mode (naver.com
+    // returns 99.8% white on all four) therefore paid for all four launches, and the
+    // cumulative memory reached the container limit on the last one: the request never
+    // returned and the OOM killer ended it.
+    //
+    // The API's own `tokio::time::timeout(wall_clock, ...)` cannot save this — the render
+    // pipeline is blocking CPU/IO work with no await points inside, so the timeout has
+    // nowhere to fire. This budget is the enforcement that actually applies.
+    //
+    // 40s sits under the server wall clock (`--timeout` + 30 = 50s) so we return an honest
+    // blank result rather than being killed, and under the 60s client timeout.
+    const RENDER_LADDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
+    let ladder_start = std::time::Instant::now();
+    let ladder_budget_left = |what: &str| -> bool {
+        let ok = ladder_start.elapsed() < RENDER_LADDER_BUDGET;
+        if !ok {
+            info!("render ladder budget ({}s) spent — skipping {}",
+                  RENDER_LADDER_BUDGET.as_secs(), what);
+        }
+        ok
+    };
+
     let cdp_enabled = std::env::var("CARAPACE_CDP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
         .unwrap_or(false);
@@ -322,7 +346,7 @@ fn browser_render(
 
         // CLI live render (default path; also the fallback when CDP is enabled but
         // failed/blanked).
-        if screenshot_result.is_err() {
+        if screenshot_result.is_err() && ladder_budget_left("CLI live render") {
             match backend::render_to_png_live(
                 base_url.as_str(), &args.output, args.width, args.height, render_ua, &page_host, 0,
             ) {
@@ -344,7 +368,10 @@ fn browser_render(
     // `file://` render with all network refused. Includes the P1 longer-settle retry.
     if screenshot_result.is_err() {
         let mut offline = backend::render_to_png(&tmp_path, &args.output, args.width, args.height, render_ua);
-        if offline.is_ok() && backend::is_blank_screenshot(&args.output) {
+        if offline.is_ok()
+            && backend::is_blank_screenshot(&args.output)
+            && ladder_budget_left("longer-settle offline retry")
+        {
             info!("offline screenshot blank — retrying with longer settle budget");
             let retry = backend::render_to_png_ex(&tmp_path, &args.output, args.width, args.height, render_ua, 9000);
             if retry.is_ok() {
@@ -1221,13 +1248,42 @@ async fn inline_css_url_refs(sheets: Vec<String>, fetcher: &SafeFetcher) -> Vec<
     }
 
     // Rewrite each sheet: substitute cached data URIs, leave others untouched.
+    //
+    // Bounded by EXPANDED output, not just by what was fetched (2026-08-18). The cache
+    // holds each resource once, but `replace_all` substitutes the full base64 payload at
+    // EVERY occurrence of that URL — and a stylesheet naming the same font in a dozen
+    // @font-face rules gets a dozen copies. naver.com turned a 3 MB fetch budget into a
+    // **218 MB** self-contained document (bbc.com 9.3 MB, edx.org 18.8 MB for scale),
+    // which is what actually exhausted the container: Chromium was then asked to render
+    // a 218 MB file:// document. Past the budget the original `url()` is left untouched;
+    // it simply does not load in the offline render, which is the same outcome as the
+    // resource having been too large to inline in the first place.
+    const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
+    let mut expanded: usize = 0;
+    let mut warned = false;
     sheets
         .into_iter()
         .map(|sheet| {
             url_re
                 .replace_all(&sheet, |caps: &regex::Captures| {
                     let raw = &caps[1];
-                    cache.get(raw).cloned().unwrap_or_else(|| caps[0].to_string())
+                    match cache.get(raw) {
+                        Some(data_uri) if expanded + data_uri.len() <= MAX_EXPANDED_BYTES => {
+                            expanded += data_uri.len();
+                            data_uri.clone()
+                        }
+                        Some(_) => {
+                            if !warned {
+                                warned = true;
+                                warn!(
+                                    "CSS data-URI expansion budget of {} B reached — leaving                                      remaining url() references un-inlined",
+                                    MAX_EXPANDED_BYTES
+                                );
+                            }
+                            caps[0].to_string()
+                        }
+                        None => caps[0].to_string(),
+                    }
                 })
                 .into_owned()
         })
