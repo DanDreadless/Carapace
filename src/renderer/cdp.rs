@@ -140,6 +140,21 @@ impl CdpPipe {
             "--disable-extensions",
             "--disable-background-networking",
             "--remote-debugging-pipe",
+            // ── Memory bounds (2026-08-18) ────────────────────────────────────
+            // The container's `mem_limit: 1g` is a DoS bound on a process that
+            // executes attacker JS, so it is a backstop, not a budget: when
+            // Chromium reached it the cgroup OOM killer took the process mid-render
+            // and the client saw a timeout or a closed connection with no error
+            // anywhere. Asset-heavy pages (naver.com) hit it on every holdout run.
+            // Bound the browser instead of raising the container limit.
+            //
+            // One renderer process: we render exactly one page per browser, so the
+            // default process-per-site pool is pure overhead here.
+            "--renderer-process-limit=1",
+            // Cap the V8 heap well under the container limit, so a page that
+            // allocates without bound loses its own renderer rather than taking the
+            // whole container — including the Carapace process serving the request.
+            "--js-flags=--max-old-space-size=256",
         ])
         .args(extra_args)
         .arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -155,6 +170,31 @@ impl CdpPipe {
         // with 3/4 during the shuffle. All CLOEXEC fds close automatically at exec.
         unsafe {
             c.pre_exec(move || {
+                // Make the browser the kernel's preferred OOM victim.
+                //
+                // `mem_limit: 1g` is a container-wide cgroup bound, so when a page
+                // exhausts it the kernel picks a victim by score — and it sometimes
+                // picked the Carapace process itself. That took down the server
+                // mid-request (the client saw a closed connection or a bare timeout,
+                // never an error), and every render that followed ran in a degraded
+                // container: edx.org rendered fine in 16s alone but timed out when a
+                // memory-hungry page had run before it. One page could therefore
+                // corrupt an entire corpus run.
+                //
+                // oom_score_adj=1000 pins the browser to the top of the kill list, so a
+                // runaway page loses its own renderer and the request fails honestly
+                // while the server and subsequent renders survive. Best-effort: a
+                // failure to write it must not abort the spawn.
+                //
+                // SAFETY: open/write/close are async-signal-safe.
+                let path = b"/proc/self/oom_score_adj\0";
+                let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
+                if fd >= 0 {
+                    let v = b"1000\n";
+                    let _ = libc::write(fd, v.as_ptr() as *const libc::c_void, v.len());
+                    let _ = libc::close(fd);
+                }
+
                 let a = libc::fcntl(cmd_r_raw, libc::F_DUPFD_CLOEXEC, 10);
                 let b = libc::fcntl(evt_w_raw, libc::F_DUPFD_CLOEXEC, 10);
                 if a < 0 || b < 0 {
@@ -225,13 +265,25 @@ impl CdpPipe {
                 }
                 return Ok(m.get("result").cloned().unwrap_or(Value::Null));
             }
-            if m.get("method").is_some() {
+            if m.get("method").is_some() && self.events.len() < Self::MAX_QUEUED_EVENTS {
                 self.events.push(m);
             }
         }
     }
 
-    /// Block until an event with `method` (on `session`) arrives, or `deadline`.
+    /// Cap on retained out-of-band CDP events.
+///
+/// `Network.enable` is always on (its drain prevents a pipe stall), so a request-heavy
+/// page emits events continuously. `drain_for` already bounded its queue, but `call`
+/// and `wait_event` pushed every non-matching event with **no bound** — so any page
+/// that kept issuing requests while we waited for one response grew this Vec of
+/// serde_json Values without limit. On naver.com the render reached 2.65 GiB and was
+/// still climbing, which is what the cgroup OOM killer was reacting to. Retaining a
+/// bounded window is enough: these events exist only so a later `wait_event` can find
+/// one that arrived early.
+const MAX_QUEUED_EVENTS: usize = 200;
+
+/// Block until an event with `method` (on `session`) arrives, or `deadline`.
     /// The hard wall-clock deadline is ultimately enforced by the watchdog kill,
     /// which closes the pipe and turns a blocked read into an error.
     fn wait_event(&mut self, method: &str, session: &str, deadline: Instant) -> Result<Value> {
@@ -251,7 +303,7 @@ impl CdpPipe {
             {
                 return Ok(m);
             }
-            if m.get("method").is_some() {
+            if m.get("method").is_some() && self.events.len() < Self::MAX_QUEUED_EVENTS {
                 self.events.push(m);
             }
         }
@@ -288,7 +340,6 @@ impl CdpPipe {
         quiet: Duration,
         mut nav: Option<&mut NavCapture>,
     ) {
-        const MAX_QUEUED_RESPONSES: usize = 200;
         let start = Instant::now();
         let floor_at = start + floor;
         let hard = start + max;
@@ -313,7 +364,7 @@ impl CdpPipe {
                         }
                     }
                     Some("Network.responseReceived") => {
-                        if self.events.len() < MAX_QUEUED_RESPONSES {
+                        if self.events.len() < Self::MAX_QUEUED_EVENTS {
                             self.events.push(m);
                         }
                     }

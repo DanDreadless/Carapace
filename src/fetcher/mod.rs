@@ -98,7 +98,25 @@ impl SafeFetcher {
     pub async fn fetch(&self, url_str: &str) -> Result<FetchResult> {
         let url = Url::parse(url_str)?;
         self.validate_url(&url)?;
-        self.fetch_url(url, 0).await
+        self.fetch_url(url, 0, None).await
+    }
+
+    /// Fetch with a per-call byte cap **lower** than the configured `max_size`.
+    ///
+    /// For callers that will discard anything above a threshold anyway. Without this
+    /// they pay full memory for a body they are about to drop: the CSS inliner
+    /// accepts 512 KB but the render path configures a 2 MB limit, so every oversized
+    /// font and image was buffered in full and then thrown away. On naver.com that is
+    /// a 1.4 MB SVG plus six ~730 KB fonts, and on a 1 GiB container sharing memory
+    /// with Chromium it was enough to trip the cgroup OOM killer mid-render — which
+    /// surfaced to the client as a timeout or a closed connection, not as an error.
+    ///
+    /// The cap can only ever LOWER the effective limit, never raise it past the
+    /// configured `max_size`.
+    pub async fn fetch_capped(&self, url_str: &str, cap: u64) -> Result<FetchResult> {
+        let url = Url::parse(url_str)?;
+        self.validate_url(&url)?;
+        self.fetch_url(url, 0, Some(cap)).await
     }
 
     // ── Validation helpers ────────────────────────────────────────────────────
@@ -160,6 +178,7 @@ impl SafeFetcher {
         &'a self,
         url: Url,
         redirect_depth: u32,
+        byte_cap: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send + 'a>> {
         Box::pin(async move {
             if redirect_depth > self.options.max_redirects {
@@ -197,7 +216,7 @@ impl SafeFetcher {
 
                 info!("redirect {} → {}", url, redirect_url);
                 self.validate_url(&redirect_url)?;
-                return self.fetch_url(redirect_url, redirect_depth + 1).await;
+                return self.fetch_url(redirect_url, redirect_depth + 1, byte_cap).await;
             }
 
             // ── Read body with size limit ─────────────────────────────────────
@@ -215,7 +234,9 @@ impl SafeFetcher {
                 .collect();
 
             let final_url = response.url().clone();
-            let max_size = self.options.max_size.unwrap_or(DEFAULT_MAX_SIZE);
+            let configured = self.options.max_size.unwrap_or(DEFAULT_MAX_SIZE);
+            // A per-call cap only ever tightens the configured limit.
+            let max_size = byte_cap.map_or(configured, |c| c.min(configured));
             let body = read_limited(response, max_size).await?;
 
             info!(
@@ -261,6 +282,31 @@ mod tests {
     #[test]
     fn default_options_block_private() {
         assert!(FetchOptions::default().block_private_ips);
+    }
+
+    /// A per-call cap must only ever TIGHTEN the configured limit. If it could raise it,
+    /// a caller could quietly opt out of the decompression-bomb ceiling the render path
+    /// sets — the opposite of why fetch_capped exists.
+    #[test]
+    fn byte_cap_only_tightens_never_raises() {
+        let configured: u64 = 2 * 1024 * 1024;
+        let effective = |cap: Option<u64>| cap.map_or(configured, |c| c.min(configured));
+        assert_eq!(effective(Some(512 * 1024)), 512 * 1024, "cap below the limit applies");
+        assert_eq!(effective(Some(64 * 1024 * 1024)), configured, "cap above the limit is ignored");
+        assert_eq!(effective(None), configured, "no cap keeps the configured limit");
+    }
+
+    /// SSRF validation must happen on the capped path too — it is a second public entry
+    /// point into fetch_url, and skipping validate_url there would be a bypass.
+    #[tokio::test]
+    async fn capped_fetch_still_blocks_private_ips() {
+        let fetcher = SafeFetcher::new(FetchOptions::default()).unwrap();
+        for u in ["http://192.168.1.1/", "http://127.0.0.1/", "http://169.254.169.254/"] {
+            assert!(
+                matches!(fetcher.fetch_capped(u, 4096).await, Err(CarapaceError::Ssrf(_))),
+                "fetch_capped must refuse {u}"
+            );
+        }
     }
 
     #[tokio::test]

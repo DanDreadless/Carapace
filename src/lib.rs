@@ -111,12 +111,30 @@ pub async fn run(args: &RenderArgs) -> Result<ThreatReport> {
         }
 
         // Images — collect raw bytes so the inliner can base64-encode them.
+        //
+        // Bounded three ways (2026-08-18). This loop had no count cap, no per-image cap
+        // and no total cap: it fetched EVERY <img> on the page at up to the render
+        // path's 2 MB limit and retained each as an owned Vec, then base64-expanded them
+        // by 4/3 for the offline document — while Chromium ran in the same 1 GiB
+        // container. Together with the CSS url() loop this reached the cgroup OOM killer
+        // on asset-heavy pages, which is what made naver.com fail every holdout run.
+        // The failure was invisible from the client, which saw only a timeout or a
+        // closed connection.
+        const MAX_IMAGES: usize = 40;
+        const MAX_IMAGE_BYTES: u64 = 512 * 1024;
+        const MAX_IMAGE_TOTAL: usize = 4 * 1024 * 1024;
         let img_urls = collect_image_urls_from_dom(&page.dom, &base_url);
-        info!("fetching {} images", img_urls.len());
-        for (src_attr, resolved_url) in img_urls {
-            match fetcher.fetch(resolved_url.as_str()).await {
+        info!("fetching {} images", img_urls.len().min(MAX_IMAGES));
+        let mut img_total: usize = 0;
+        for (src_attr, resolved_url) in img_urls.into_iter().take(MAX_IMAGES) {
+            if img_total >= MAX_IMAGE_TOTAL {
+                tracing::warn!("image inline budget of {} B reached, skipping the rest", MAX_IMAGE_TOTAL);
+                break;
+            }
+            match fetcher.fetch_capped(resolved_url.as_str(), MAX_IMAGE_BYTES).await {
                 Ok(r) => {
                     check_drive_by_download(&r, &mut report);
+                    img_total += r.body.len();
                     image_bytes.insert(src_attr, r.body.to_vec());
                 }
                 Err(e) => tracing::warn!("failed to fetch image {}: {}", resolved_url, e),
@@ -1172,11 +1190,27 @@ async fn inline_css_url_refs(sheets: Vec<String>, fetcher: &SafeFetcher) -> Vec<
 
     info!("inlining {} CSS url() resource(s) as data URIs", unique_urls.len());
 
+    // Total inlined bytes across ALL resources. MAX_URLS × MAX_BYTES is 15 MB raw and
+    // ~20 MB once base64-expanded, held simultaneously in `cache` while Chromium is
+    // running in the same 1 GiB container — enough on its own to reach the cgroup OOM
+    // killer, which is what was killing renders of asset-heavy pages (naver.com).
+    // A per-resource limit does not bound the sum; this does.
+    const MAX_TOTAL_BYTES: usize = 3 * 1024 * 1024;
+
     // Fetch each unique URL once and build a rewrite cache.
     let mut cache: HashMap<String, String> = HashMap::with_capacity(unique_urls.len());
+    let mut total_bytes: usize = 0;
     for url in &unique_urls {
-        match fetcher.fetch(url).await {
+        if total_bytes >= MAX_TOTAL_BYTES {
+            warn!("CSS url() inline budget of {} B reached, skipping the rest", MAX_TOTAL_BYTES);
+            break;
+        }
+        // Cap the DOWNLOAD, not just the acceptance test. `fetch` would honour the
+        // render path's 2 MB limit and hand back a body we then discard; capping at
+        // MAX_BYTES aborts on Content-Length or mid-stream instead.
+        match fetcher.fetch_capped(url, MAX_BYTES as u64).await {
             Ok(r) if !r.body.is_empty() && r.body.len() <= MAX_BYTES => {
+                total_bytes += r.body.len();
                 let mime = guess_resource_mime(&r.body, &r.content_type, url);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&r.body);
                 cache.insert(url.clone(), format!("url('data:{};base64,{}')", mime, b64));
