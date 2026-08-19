@@ -76,6 +76,25 @@ struct NavCapture {
     sid: String,
     first_doc: bool,
     targets: Vec<String>,
+    /// frameId of the initial (main-frame) Document request. Every later Document in
+    /// THIS frame is a client-side redirect; a Document in any other frame is an
+    /// **iframe**, which is not a navigation and must not be captured or blocked.
+    main_frame: String,
+}
+
+/// The main frame's id for a page target.
+///
+/// Chromium sets a page target's main-frame id equal to its **targetId**, so this needs
+/// no extra CDP round-trip and — critically — no `Page.enable`, which would switch on an
+/// event domain the CDP design deliberately keeps off (see the module header: no event
+/// domains means an adversarial page cannot flood the control pipe).
+///
+/// Do NOT infer the main frame from "whichever Document paused first": an iframe is a
+/// Document too, so if the initial navigation does not pause (a `data:` URL, or a nav
+/// committed before `Fetch.enable`) the first pause seen IS an iframe, which would then
+/// define itself as the main frame and let the real navigation be treated as a sub-frame.
+fn main_frame_id_from_target(target_id: &str) -> String {
+    target_id.to_string()
 }
 
 fn chromium_bin() -> Option<&'static str> {
@@ -428,8 +447,41 @@ const MAX_QUEUED_EVENTS: usize = 200;
             self.send_cmd(&nc.sid, "Fetch.continueRequest", json!({ "requestId": rid }));
             return;
         }
-        if nc.first_doc {
+        let frame_id = p
+            .and_then(|p| p.get("frameId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // Frame check FIRST. An iframe is a `resourceType: Document` too — the plan's
+        // "Document-only excludes subresources" holds for scripts/images/XHR but not for
+        // sub-frames — and nothing here checked the frame. Two real consequences:
+        // legitimate iframes were FAILED mid-render, and their URLs were handed to the
+        // Python side as client-side redirect destinations. citi.com's anti-fraud vendor
+        // loads three `crossdomain.html` iframes on per-session rotating hex domains;
+        // each was followed as a redirect hop, scored DGA=1.00 and reported HIGH,
+        // flipping a major bank to SUSPICIOUS on ~half of scans.
+        //
+        // This must run BEFORE the first_doc latch: the iframe request routinely arrives
+        // FIRST, so a latch that consumed it would both mis-bind the main frame and
+        // spend the initial-navigation slot on a sub-frame.
+        if !nc.main_frame.is_empty() && !frame_id.is_empty() && frame_id != nc.main_frame {
+            // An IFRAME, not a navigation. `resourceType: Document` covers sub-frames as
+            // well as the main frame — the plan's "Document-only excludes subresources"
+            // is true of scripts/images/XHR but NOT of iframes, and nothing here checked
+            // the frame. Two consequences, both real: legitimate sub-frames were being
+            // FAILED mid-render, and their URLs were reported to the Python side as
+            // client-side redirect destinations. citi.com's anti-fraud vendor loads three
+            // `crossdomain.html` iframes on per-session rotating hex domains; each was
+            // followed as a "redirect hop", scored DGA=1.00 and reported HIGH, flipping a
+            // major bank to SUSPICIOUS on roughly half of scans.
+            self.send_cmd(&nc.sid, "Fetch.continueRequest", json!({ "requestId": rid }));
+        } else if nc.first_doc {
+            // The initial, already-SSRF-validated navigation.
             nc.first_doc = false;
+            if nc.main_frame.is_empty() {
+                // Fallback only: main_frame is normally seeded from the targetId.
+                nc.main_frame = frame_id;
+            }
             self.send_cmd(&nc.sid, "Fetch.continueRequest", json!({ "requestId": rid }));
         } else {
             // Redirect: record (bounded, deduped) + block. Nothing is dispatched to
@@ -731,7 +783,9 @@ pub fn cdp_render(
                     "urlPattern": "*", "requestStage": "Request", "resourceType": "Document"
                 } ] }),
             )?;
-            Some(NavCapture { sid: sid.clone(), first_doc: true, targets: Vec::new() })
+            let mf = main_frame_id_from_target(&target_id);
+            Some(NavCapture { sid: sid.clone(), first_doc: true, targets: Vec::new(),
+                              main_frame: mf })
         } else {
             None
         };
@@ -1085,7 +1139,8 @@ mod cdp_spike_tests {
                 "patterns": [ { "urlPattern": "*", "requestStage": "Request", "resourceType": "Document" } ]
             }))?;
             // first_doc:false — the validated initial nav is modelled as already done.
-            let mut navcap = NavCapture { sid: sid.clone(), first_doc: false, targets: Vec::new() };
+            let mut navcap = NavCapture { sid: sid.clone(), first_doc: false, targets: Vec::new(),
+                                          main_frame: String::new() };
             sess.send_cmd(&sid, "Page.navigate", json!({ "url": url }));
             sess.drain_until_idle(
                 Duration::from_millis(800),
@@ -1106,6 +1161,77 @@ mod cdp_spike_tests {
         assert!(
             targets.iter().any(|u| u.contains("169.254.169.254")),
             "internal-host redirect captured+failed (never continued); targets: {:?}", targets
+        );
+    }
+
+    /// An IFRAME is a `resourceType: Document` too, and the latch had no frame check —
+    /// so every sub-frame was recorded as a "client-side redirect destination" AND
+    /// failed mid-render. citi.com's anti-fraud vendor loads three `crossdomain.html`
+    /// iframes on per-session rotating hex domains; the Python side followed each as a
+    /// redirect hop, scored it DGA=1.00 and reported HIGH, flipping a major bank to
+    /// SUSPICIOUS on roughly half of scans.
+    ///
+    /// Drives the PRODUCTION drain + handler, like the F1 guard above. The main-frame
+    /// redirect must still be captured — that is the whole feature — while the iframe
+    /// must be continued and absent from the targets.
+    #[test]
+    fn iframe_document_is_not_captured_as_a_navigation() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping iframe nav-capture test: no chromium on this host");
+            return;
+        }
+        let profile = unique_profile_dir();
+        let mut sess = CdpPipe::launch(&profile, &[]).expect("launch");
+        let (done, watchdog) = spawn_watchdog(sess.pgid, Duration::from_secs(10));
+        // An iframe to one host, then a main-frame redirect to another.
+        let url = "data:text/html,<html><body>page\
+                   <iframe src=\"https://frame.example.test/crossdomain.html\"></iframe>\
+                   <script>setTimeout(function(){location.replace('https://dest.example.test/go');},300);</script>\
+                   </body></html>";
+
+        let targets = (|| -> Result<Vec<String>> {
+            let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+            let tid = created.get("targetId").and_then(Value::as_str)
+                .ok_or_else(|| err("no targetId"))?.to_string();
+            let attached = sess.call(None, "Target.attachToTarget",
+                json!({ "targetId": tid, "flatten": true }))?;
+            let sid = attached.get("sessionId").and_then(Value::as_str)
+                .ok_or_else(|| err("no sessionId"))?.to_string();
+            sess.call(Some(&sid), "Network.enable", json!({}))?;
+            sess.call(Some(&sid), "Fetch.enable", json!({
+                "patterns": [ { "urlPattern": "*", "requestStage": "Request", "resourceType": "Document" } ]
+            }))?;
+            // first_doc:false — like the F1 guard above, the validated initial navigation
+            // is modelled as already done (a `data:` URL does not pause, so it cannot
+            // consume the latch here). main_frame is seeded from the targetId exactly as
+            // production seeds it, which is the behaviour under test.
+            let mf = main_frame_id_from_target(&tid);
+            let mut navcap = NavCapture { sid: sid.clone(), first_doc: false, targets: Vec::new(),
+                                          main_frame: mf };
+            sess.send_cmd(&sid, "Page.navigate", json!({ "url": url }));
+            sess.drain_until_idle(
+                Duration::from_millis(1200),
+                Duration::from_millis(4000),
+                Duration::from_millis(400),
+                Some(&mut navcap),
+            );
+            Ok(navcap.targets)
+        })();
+
+        done.store(true, Ordering::Relaxed);
+        let _ = sess.call(None, "Browser.close", json!({}));
+        sess.kill();
+        let _ = watchdog.join();
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let targets = targets.expect("iframe render");
+        assert!(
+            !targets.iter().any(|u| u.contains("frame.example.test")),
+            "iframe Document must NOT be captured as a navigation; targets: {:?}", targets
+        );
+        assert!(
+            targets.iter().any(|u| u.contains("dest.example.test")),
+            "main-frame redirect must still be captured; targets: {:?}", targets
         );
     }
 }
