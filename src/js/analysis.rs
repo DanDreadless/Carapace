@@ -692,9 +692,29 @@ const PROBE_GATE_WINDOW: usize = 700;
 fn probe_gates_content(src: &str, start: usize, end: usize) -> bool {
     static GATE_RE: OnceLock<Regex> = OnceLock::new();
     let re = GATE_RE.get_or_init(|| {
+        // A navigation is a WRITE to location, not a read of it. Ported from the Python
+        // `_gates_content` narrowing (engine 2.1.48): the old alternation accepted a bare
+        // `location.href` / `window.location` token anywhere in the window, so code that
+        // merely READS the current URL satisfied "gates content delivery" — the finding's
+        // entire claim. ethereum.org's Matomo helper returns "webdriver"/"human" for an
+        // analytics dimension while `window.location.href.split(...)` three lines away
+        // builds the tracked URL; nothing is gated and the page is byte-identical for a
+        // bot and a human, yet it scored HIGH.
+        //
+        // `=[^=]` excludes `==`; every other comparison and compound operator is already
+        // excluded because `\s*=` cannot reach across a non-whitespace operator char
+        // (`!=`, `>=`, `+=` …). Rust's regex crate has no lookaround, hence the trailing
+        // char class rather than the Python side's lookbehind — same effect.
+        //
+        // MUST be kept in step with `_check_webdriver_probe._gates_content` in
+        // backend/scanner/modules/js_analyser.py. These two layers drifted once before
+        // (the Python HIGH/LOW split shipped in 2.1.0 and reached Carapace only in
+        // 2.1.36, mislabelling currys.co.uk in between) — change both together.
         Regex::new(concat!(
-            r#"(?i)location\s*(?:\.\s*(?:href|replace|assign)|\s*=)"#,
-            r#"|window\s*\.\s*location|document\s*\.\s*write|\.\s*innerHTML\s*="#,
+            r#"(?i)(?:(?:window|document|top|self|parent)\s*\.\s*)?location"#,
+            r#"(?:\s*\.\s*href)?\s*=[^=]"#,
+            r#"|(?:(?:window|document|top|self|parent)\s*\.\s*)?location\s*\.\s*(?:replace|assign)\s*\("#,
+            r#"|document\s*\.\s*write|\.\s*innerHTML\s*="#,
             r#"|\bfetch\s*\(|XMLHttpRequest|window\s*\.\s*open\s*\("#,
             r#"|createElement\s*\(\s*["']script["']|\.\s*src\s*=|\beval\s*\(|\bimport\s*\("#,
         ))
@@ -848,6 +868,34 @@ mod tests {
                 "gating probe lost its cloaking technique ({want}): {src}"
             );
         }
+    }
+
+    /// Reading `location` is not gating content. The Matomo shape from ethereum.org,
+    /// ported alongside the Python narrowing (engine 2.1.48): a probe whose result feeds
+    /// an analytics dimension, with `location.href` read nearby to build a tracked URL.
+    /// Nothing is delivered differently, so this must be ungated (LOW).
+    #[test]
+    fn reading_location_is_not_a_content_gate() {
+        let src = "function detectAutomation(){ return navigator.webdriver ? 'webdriver' : 'human'; }\n\
+                   var dim = detectAutomation();\n\
+                   var tracked = window.location.href.split(/[?#]/)[0];\n\
+                   _paq.push(['setCustomDimension', 3, dim]);\n\
+                   _paq.push(['setCustomUrl', tracked]);";
+        let report = run(src);
+        assert!(
+            report.js_flags().iter().any(|f| matches!(
+                f, JsFlag::SandboxEvasion { technique, .. } if technique == "webdriver_check_ungated"
+            )),
+            "a location READ must not count as gating content"
+        );
+        // And an equality test on the current URL is still a read, not a navigation.
+        let eq = "if (navigator.webdriver) { flag = (location.href == canonical); }";
+        assert!(
+            run(eq).js_flags().iter().any(|f| matches!(
+                f, JsFlag::SandboxEvasion { technique, .. } if technique == "webdriver_check_ungated"
+            )),
+            "`location.href ==` is a comparison, not an assignment"
+        );
     }
 
     /// The FP direction: the same probes with nothing gated on the result. These are the

@@ -441,10 +441,13 @@ fn browser_render(
     // Filter out same-site requests (own domain / subdomains) — these are
     // normal WordPress REST API calls, lazy-load fetches, etc. and are not
     // evidence of C2 communication or payload retrieval.
+    // Also filter Chromium's own service traffic: it is not page-originated, so
+    // attributing it to the page's JavaScript is a false statement in the evidence
+    // block (see `is_browser_infrastructure`).
     if let Ok(ref intercepted) = screenshot_result {
         let external: Vec<String> = intercepted
             .iter()
-            .filter(|u| !is_same_site(&base_url, u))
+            .filter(|u| !is_same_site(&base_url, u) && !is_browser_infrastructure(u))
             .cloned()
             .collect();
         if !external.is_empty() {
@@ -1168,6 +1171,78 @@ fn is_same_site(base: &url::Url, intercepted_url: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns `true` when `intercepted_url` is Chromium's OWN service traffic rather
+/// than a request the rendered page made.
+///
+/// The interception proxy records every connection that crosses it, and the whole
+/// set is then reported as "JavaScript on this page attempted to make one or more
+/// network requests at runtime". That attribution is wrong for the browser's own
+/// background services — the component updater, the certificate-revocation
+/// endpoints, Safe Browsing, the variations/field-trial fetch — which fire on every
+/// render regardless of page content. The result was a LOW renderer finding on
+/// essentially every scan, including on pages containing zero scripts
+/// (`xdashboard.xyz`, 0 scripts found, evidence: `https://redirector.gvt1.com`),
+/// which is a false attribution and dilutes a signal that exists to surface
+/// payload-delivery and C2 fetches.
+///
+/// Deliberately narrow: only hosts that belong to Chromium's own update/telemetry
+/// infrastructure and that a page has no ordinary reason to contact. Google's
+/// general web properties are NOT listed here — a page fetching googleapis.com is a
+/// page-originated request, and suppressing those is the job of the known-good CDN
+/// filter on the Insight side, not of an attribution test.
+fn is_browser_infrastructure(intercepted_url: &str) -> bool {
+    let Ok(iurl) = url::Url::parse(intercepted_url) else { return false };
+    let Some(host) = iurl.host_str() else { return false };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+
+    // Chromium component updater / on-demand download redirector.
+    if host == "gvt1.com" || host.ends_with(".gvt1.com")
+        || host == "gvt2.com" || host.ends_with(".gvt2.com")
+        || host == "gvt3.com" || host.ends_with(".gvt3.com")
+    {
+        return true;
+    }
+    // Certificate revocation (OCSP/CRL) fetched by the TLS stack, not by the page.
+    if host == "pki.goog" || host.ends_with(".pki.goog") {
+        return true;
+    }
+    const BROWSER_SERVICE_HOSTS: &[&str] = &[
+        // Component / extension / CRX update endpoints.
+        "clients1.google.com",
+        "clients2.google.com",
+        "clients3.google.com",
+        "clients4.google.com",
+        "clients5.google.com",
+        "update.googleapis.com",
+        "clientservices.googleapis.com",
+        // Field trials / variations seed, fetched at browser start-up.
+        "chromiumdash.appspot.com",
+        // Safe Browsing lookups performed by the browser itself.
+        "safebrowsing.googleapis.com",
+        "safebrowsing.google.com",
+        "sb-ssl.google.com",
+        // Optimisation-guide / autofill model downloads.
+        "optimizationguide-pa.googleapis.com",
+        "content-autofill.googleapis.com",
+        // Network-connectivity ("captive portal") probe.
+        "connectivitycheck.gstatic.com",
+        "www.gstatic.com/generate_204",
+        // Chromium's default-search connectivity probe. Restricted to the bare
+        // `www.google.<tld>` origin so that a genuine page fetch of a Google
+        // service path is still attributed to the page.
+        "google.internal",
+    ];
+    if BROWSER_SERVICE_HOSTS.iter().any(|h| host == *h) {
+        return true;
+    }
+    // `www.google.<tld>` with an empty/`/` path is the browser's own search-engine
+    // reachability probe. A page fetching google.<tld> always requests a real path.
+    if host.starts_with("www.google.") && matches!(iurl.path(), "" | "/") {
+        return true;
+    }
+    false
 }
 
 // ── CSS url() inlining ────────────────────────────────────────────────────────
