@@ -307,6 +307,89 @@ pub async fn render(
     .into_response()
 }
 
+// ── Solve handler (Cloudflare challenge → the page behind it) ─────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SolveRequest {
+    /// The challenged URL. http(s) only; https-only when the server enforces it.
+    pub url: String,
+}
+
+/// Hard ceiling on one solve, independent of `--timeout`: a managed challenge clears
+/// in 3–8 s when it is going to clear at all, and a solve holds a render permit.
+const MAX_SOLVE_SECS: u64 = 25;
+
+pub async fn solve(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SolveRequest>,
+) -> Response {
+    if let Some(expected) = &state.api_key {
+        let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if provided != expected {
+            warn!("solve rejected: invalid API key");
+            return err_resp(StatusCode::UNAUTHORIZED, "invalid or missing X-API-Key");
+        }
+    }
+
+    // Validate before taking a permit. The policy proxy SSRF-checks every connection the
+    // browser makes, so this is the first gate, not the only one: it keeps non-web
+    // schemes (file:, data:, chrome:) away from the browser entirely.
+    let parsed = match url::Url::parse(&req.url) {
+        Ok(u) => u,
+        Err(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid url"),
+    };
+    let scheme_ok = match parsed.scheme() {
+        "https" => true,
+        "http" => !state.https_only,
+        _ => false,
+    };
+    if !scheme_ok {
+        return err_resp(StatusCode::BAD_REQUEST, "unsupported url scheme");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return err_resp(StatusCode::BAD_REQUEST, "credentials in url are not allowed");
+    }
+    let host = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
+        // An IP-literal target cannot carry a Cloudflare challenge worth solving, and
+        // refusing it removes the most direct internal-address request shape outright.
+        _ => return err_resp(StatusCode::BAD_REQUEST, "url must use a hostname"),
+    };
+
+    let _permit = match state.semaphore.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!("solve rejected: at concurrency limit");
+            return err_resp(StatusCode::TOO_MANY_REQUESTS, "server busy — try again shortly");
+        }
+    };
+
+    info!("API solve: {}", req.url);
+    let deadline = Duration::from_secs(state.timeout_secs.clamp(10, MAX_SOLVE_SECS));
+    let url = parsed.to_string();
+    let task = tokio::task::spawn_blocking(move || {
+        crate::renderer::cdp::cdp_solve_challenge(&url, &host, deadline)
+    })
+    .await;
+
+    match task {
+        Ok(Ok(out)) => {
+            info!(
+                "API solve complete: {} solved={} absent={} clearance={} document={} in {}ms",
+                req.url, out.solved, out.challenge_absent, out.clearance_source,
+                out.document.as_ref().map(|d| d.status).unwrap_or(0), out.elapsed_ms,
+            );
+            Json(out).into_response()
+        }
+        Ok(Err(e)) => {
+            warn!("solve failed for {}: {}", req.url, e);
+            err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("task panicked: {e}")),
+    }
+}
+
 // ── Analyse handler (LJS-06) ──────────────────────────────────────────────────
 //
 // Runs OXC-based static JS analysis on a URL or raw content without any

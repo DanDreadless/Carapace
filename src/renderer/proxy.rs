@@ -131,6 +131,14 @@ pub struct PolicyProxy {
 
 impl PolicyProxy {
     pub fn start(policy: RenderPolicy) -> Self {
+        Self::start_with_budget(policy, RENDER_BUDGET)
+    }
+
+    /// As [`start`](Self::start), with a caller-chosen lifetime budget. The challenge
+    /// solver (`cdp::cdp_solve_challenge`) needs one longer than a render's: a
+    /// Cloudflare managed challenge routinely takes 3–8 s to clear and then reloads the
+    /// page, so the 9 s render budget would refuse the post-challenge reload itself.
+    pub fn start_with_budget(policy: RenderPolicy, budget: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind policy proxy");
         let port = listener.local_addr().expect("no local addr").port();
         listener.set_nonblocking(true).ok();
@@ -152,7 +160,7 @@ impl PolicyProxy {
                         // Past the total render budget the screenshot is imminent —
                         // refuse new connections immediately rather than starting a
                         // connect that would linger past capture.
-                        if started.elapsed() > RENDER_BUDGET {
+                        if started.elapsed() > budget {
                             refuse(&mut stream);
                             continue;
                         }

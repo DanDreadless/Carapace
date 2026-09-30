@@ -3,6 +3,7 @@
 /// Exposes three endpoints:
 ///   POST /render   — fetch a URL, render it with Chromium, return image + threat report
 ///   POST /analyse  — run OXC static JS analysis on a URL or raw content (no Chromium)
+///   POST /solve    — clear a Cloudflare challenge in Chromium, return the page behind it
 ///   GET  /health   — liveness probe
 ///
 /// Authentication is optional: set `--api-key` (or `CARAPACE_API_KEY` env var)
@@ -52,6 +53,7 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
 
     let app = Router::new()
         .route("/render", post(handlers::render))
+        .route("/solve", post(handlers::solve))
         .route("/health", get(handlers::health))
         .route("/analyse", post(handlers::analyse))
         .with_state(state)

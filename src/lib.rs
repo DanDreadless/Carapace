@@ -1192,7 +1192,7 @@ fn is_same_site(base: &url::Url, intercepted_url: &str) -> bool {
 /// general web properties are NOT listed here — a page fetching googleapis.com is a
 /// page-originated request, and suppressing those is the job of the known-good CDN
 /// filter on the Insight side, not of an attribution test.
-fn is_browser_infrastructure(intercepted_url: &str) -> bool {
+pub(crate) fn is_browser_infrastructure(intercepted_url: &str) -> bool {
     let Ok(iurl) = url::Url::parse(intercepted_url) else { return false };
     let Some(host) = iurl.host_str() else { return false };
     let host = host.trim_end_matches('.').to_ascii_lowercase();

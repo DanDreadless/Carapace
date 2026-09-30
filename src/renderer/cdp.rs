@@ -916,6 +916,553 @@ pub fn cdp_render(
     })
 }
 
+// ── Cloudflare challenge solver (/solve) ──────────────────────────────────────
+//
+// FlareSolverr-equivalent, built on the render path's confinement instead of a second,
+// unconfined browser: a real Chromium executes the Cloudflare managed/JS challenge and
+// the solver returns the DOCUMENT THE SERVER SENT — raw body bytes and response
+// headers, captured over CDP `Network` — for the Python pipeline to analyse.
+//
+// Why the document and not the cookies. The first version returned the clearance
+// cookies for the Python fetcher to replay. That cannot work behind the VPN egress:
+// Cloudflare binds `cf_clearance` to the IP that solved the challenge, and NordVPN
+// gives every session its own exit IP from the server's pool (measured 2026-09-30:
+// Carapace's tunnel exited on .219, celery's on .216). A replay from another container
+// is a replay from another IP. Returning the page itself keeps the whole exchange on
+// one IP, and also covers the case replay never could — Cloudflare waving the real
+// browser straight through while still blocking curl_cffi's TLS fingerprint
+// (capterra.com: no challenge in Chromium, "Just a moment..." to curl_cffi).
+//
+// Clearance is still REUSED, but inside Carapace: a per-host cache feeds the cookies
+// back into the next solve's browser before it navigates, so a repeat scan of a
+// challenged site skips the challenge. Clearance values never leave this process.
+//
+// What differs from `cdp_render`, and why each difference is safe:
+//   * NO bootstrap. The render bootstrap suppresses navigation (the challenge completes
+//     by reloading the page) and redefines `navigator` getters (a tamper signal the
+//     challenge script checks for). The solver has nothing to screenshot.
+//   * The policy proxy additionally allows `challenges.cloudflare.com` — the Turnstile
+//     host a managed challenge loads cross-origin. It is Cloudflare's own service, not
+//     attacker infrastructure; SSRF enforcement on every connection is unchanged.
+//   * The UA is Chromium's own with the `HeadlessChrome` token rewritten to `Chrome`,
+//     set by the `--user-agent` FLAG, which keeps the native Sec-CH-UA client hints
+//     consistent (measured on Chromium 151).
+//   * `Network` is enabled (to see the main-frame response and read its body) but
+//     `Runtime`/`Page` are not — `Runtime.enable` is a well-known automation tell.
+//     Every Network event is drained by `pump`/`absorb`, and `call()` bounds its queue,
+//     so a request-heavy page cannot stall the pipe or grow memory without limit.
+
+/// Cloudflare cookie names. Only these are cached; nothing else a page sets survives
+/// the solve.
+const CF_COOKIE_NAMES: &[&str] = &["cf_clearance", "__cf_bm", "_cfuvid"];
+/// Extra host the solver's proxy allows: Cloudflare Turnstile / challenge platform.
+const CF_CHALLENGE_HOSTS: &str = "challenges.cloudflare.com";
+/// How often the solver polls for clearance while the challenge runs.
+const SOLVE_POLL: Duration = Duration::from_millis(500);
+/// Largest document body returned (matches the Python fetcher's page cap).
+const MAX_DOC_BYTES: usize = 5 * 1024 * 1024;
+/// Bounds on the returned response headers.
+const MAX_DOC_HEADERS: usize = 64;
+const MAX_HEADER_VALUE: usize = 8192;
+/// A cached clearance is dropped after this long even if Cloudflare's own expiry is
+/// later: the egress IP it is bound to can change on a VPN reconnect, and a stale
+/// entry only costs one re-solve.
+const CLEARANCE_TTL_MAX: Duration = Duration::from_secs(25 * 60);
+const CLEARANCE_CACHE_MAX: usize = 256;
+
+/// The main-frame document the server returned to Chromium.
+#[derive(Debug, serde::Serialize)]
+pub struct SolvedDocument {
+    pub url: String,
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Raw response body, base64 (the page may not be UTF-8).
+    pub body_b64: String,
+    pub truncated: bool,
+}
+
+/// Result of one challenge solve.
+#[derive(Debug, serde::Serialize)]
+pub struct SolveOutput {
+    /// `cf_clearance` present AND the challenge interstitial is gone.
+    pub solved: bool,
+    /// The page loaded without any challenge interstitial (nothing to solve).
+    pub challenge_absent: bool,
+    /// "fresh" (challenge solved now), "cached" (a cached clearance was accepted), or
+    /// "none" (no clearance involved).
+    pub clearance_source: String,
+    pub final_url: String,
+    pub title: String,
+    /// Names only, for evidence — clearance values never leave Carapace.
+    pub cookie_names: Vec<String>,
+    pub user_agent: String,
+    /// The last main-frame document response. `None` when it could not be captured.
+    pub document: Option<SolvedDocument>,
+    /// Ordered main-frame navigations the browser attempted (http/https, ≤10), server
+    /// redirects included — the path a JavaScript gate sends a visitor down. A
+    /// cross-origin hop appears here even though the policy proxy refused to fetch it.
+    pub nav_chain: Vec<String>,
+    pub elapsed_ms: u64,
+    /// Cross-origin requests the policy proxy refused during the solve.
+    pub intercepted: Vec<String>,
+}
+
+// ── Per-host clearance cache ──────────────────────────────────────────────────
+
+struct CachedClearance {
+    /// CDP `Network.CookieParam` objects, ready for `Network.setCookies`.
+    cookies: Vec<Value>,
+    expires_at: Instant,
+}
+
+fn clearance_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedClearance>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedClearance>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// RFC 6265 domain-match: `host` equals the cookie domain or is a subdomain of it.
+fn cookie_domain_matches(cookie_domain: &str, host: &str) -> bool {
+    let d = cookie_domain.trim_start_matches('.').to_ascii_lowercase();
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    !d.is_empty() && d.contains('.') && (h == d || h.ends_with(&format!(".{d}")))
+}
+
+fn cached_clearance(host: &str) -> Option<Vec<Value>> {
+    let mut cache = clearance_cache().lock().ok()?;
+    let now = Instant::now();
+    cache.retain(|_, c| c.expires_at > now);
+    cache.get(host).map(|c| c.cookies.clone())
+}
+
+fn drop_clearance(host: &str) {
+    if let Ok(mut cache) = clearance_cache().lock() {
+        cache.remove(host);
+    }
+}
+
+/// Cache the Cloudflare cookies from a `Storage.getCookies` result for `host`. Only
+/// cookies whose domain covers `host` are kept; nothing is stored without a
+/// `cf_clearance`.
+fn store_clearance(host: &str, all_cookies: &[Value]) {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut ttl = CLEARANCE_TTL_MAX;
+    for c in all_cookies {
+        let (Some(name), Some(value), Some(domain)) = (
+            c.get("name").and_then(Value::as_str),
+            c.get("value").and_then(Value::as_str),
+            c.get("domain").and_then(Value::as_str),
+        ) else { continue };
+        if !CF_COOKIE_NAMES.contains(&name) || !cookie_domain_matches(domain, host) || value.len() > 4096 {
+            continue;
+        }
+        let expires = c.get("expires").and_then(Value::as_f64).unwrap_or(-1.0);
+        if name == "cf_clearance" && expires > 0.0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let left = (expires - now - 60.0).max(0.0);
+            ttl = ttl.min(Duration::from_secs_f64(left));
+        }
+        let mut p = json!({
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": c.get("path").and_then(Value::as_str).unwrap_or("/"),
+            "secure": c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            "httpOnly": c.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+        });
+        if expires > 0.0 {
+            p["expires"] = json!(expires);
+        }
+        kept.push(p);
+    }
+    if !kept.iter().any(|c| c["name"] == "cf_clearance") || ttl.is_zero() {
+        return;
+    }
+    if let Ok(mut cache) = clearance_cache().lock() {
+        let now = Instant::now();
+        cache.retain(|_, c| c.expires_at > now);
+        if cache.len() >= CLEARANCE_CACHE_MAX && !cache.contains_key(host) {
+            // Evict whichever entry expires soonest.
+            if let Some(k) = cache.iter().min_by_key(|(_, c)| c.expires_at).map(|(k, _)| k.clone()) {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(host.to_string(), CachedClearance { cookies: kept, expires_at: now + ttl });
+    }
+}
+
+// ── Main-frame document tracking ──────────────────────────────────────────────
+
+/// Remembers the LAST main-frame `Document` response seen — after a challenge clears,
+/// that is the real page, not the interstitial — and the ordered chain of main-frame
+/// navigations the browser attempted. Sub-frame documents (the Turnstile iframe, any
+/// page iframe) are ignored by frame id, the same rule as nav capture.
+///
+/// The chain is how a JavaScript cloaking gate is followed: the gate re-enters its own
+/// site with a proof-of-JS token and the server then forwards the visitor — often
+/// off-site into a traffic broker. Every hop, server redirects included, reaches
+/// `Network.requestWillBeSent` as a Document request, INCLUDING a cross-origin hop the
+/// policy proxy then refuses. So the destination is recorded without any cross-origin
+/// content ever being fetched here; the caller SSRF-validates it before following.
+struct DocTracker {
+    main_frame: String,
+    last: Option<(String, String, u16, Value)>, // (requestId, url, status, headers)
+    nav_chain: Vec<String>,
+}
+
+/// Bound on recorded main-frame hops.
+const MAX_NAV_CHAIN: usize = 10;
+
+impl DocTracker {
+    fn new(main_frame: String) -> Self {
+        Self { main_frame, last: None, nav_chain: Vec::new() }
+    }
+
+    fn observe(&mut self, m: &Value) {
+        let method = m.get("method").and_then(Value::as_str);
+        if method == Some("Network.requestWillBeSent") {
+            let Some(p) = m.get("params") else { return };
+            if p.get("type").and_then(Value::as_str) == Some("Document")
+                && p.get("frameId").and_then(Value::as_str) == Some(self.main_frame.as_str())
+            {
+                let u = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
+                if (u.starts_with("http://") || u.starts_with("https://"))
+                    && self.nav_chain.len() < MAX_NAV_CHAIN
+                    && self.nav_chain.last().map(String::as_str) != Some(u)
+                {
+                    self.nav_chain.push(u.chars().take(2048).collect());
+                }
+            }
+            return;
+        }
+        if method != Some("Network.responseReceived") {
+            return;
+        }
+        let Some(p) = m.get("params") else { return };
+        if p.get("type").and_then(Value::as_str) != Some("Document")
+            || p.get("frameId").and_then(Value::as_str) != Some(self.main_frame.as_str())
+        {
+            return;
+        }
+        let rid = p.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
+        let url = p.pointer("/response/url").and_then(Value::as_str).unwrap_or("").to_string();
+        let status = p.pointer("/response/status").and_then(Value::as_f64).unwrap_or(0.0) as u16;
+        let headers = p.pointer("/response/headers").cloned().unwrap_or(Value::Null);
+        if !rid.is_empty() {
+            self.last = Some((rid, url, status, headers));
+        }
+    }
+}
+
+/// Feed any events `call()` queued while waiting for a response into the tracker.
+fn absorb(sess: &mut CdpPipe, docs: &mut DocTracker) {
+    for e in std::mem::take(&mut sess.events) {
+        docs.observe(&e);
+    }
+}
+
+/// Read CDP messages for `dur`, feeding each to the tracker — keeps the pipe drained
+/// between polls (Network is enabled, so events arrive continuously).
+fn pump(sess: &mut CdpPipe, dur: Duration, docs: &mut DocTracker) {
+    absorb(sess, docs);
+    let fd = sess.evt.get_ref().as_raw_fd();
+    let until = Instant::now() + dur;
+    while Instant::now() < until {
+        match sess.read_one(fd, 50) {
+            Ok(Some(m)) => docs.observe(&m),
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn header_map(v: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj.iter().take(MAX_DOC_HEADERS) {
+            if let Some(s) = val.as_str() {
+                out.insert(
+                    k.chars().take(128).collect(),
+                    s.chars().take(MAX_HEADER_VALUE).collect(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Chromium's own UA with the headless token removed, in reduced-UA form
+/// (`Chrome/<major>.0.0.0`, the shape real Chrome has sent since UA reduction).
+/// Derived once from `chromium --version`; falls back to the render UA's major.
+fn solver_user_agent() -> &'static str {
+    static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UA.get_or_init(|| {
+        let major = chromium_bin()
+            .and_then(|b| Command::new(b).arg("--version").output().ok())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|v| {
+                v.split_whitespace()
+                    .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                    .and_then(|t| t.split('.').next().map(str::to_string))
+            })
+            .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or_else(|| "133".to_string());
+        format!(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/{major}.0.0.0 Safari/537.36"
+        )
+    })
+}
+
+/// True while the document is still a Cloudflare challenge interstitial. Mirrors the
+/// Python `fetcher._is_cf_challenge_response` markers — NOT `/cdn-cgi/challenge-platform/`,
+/// which is the passive JS Detections beacon present on ordinary pages.
+const CHALLENGE_PRESENT_JS: &str = r#"(function(){try{
+  var t=(document.title||'').toLowerCase();
+  var h=document.documentElement?document.documentElement.innerHTML:'';
+  return t.indexOf('just a moment')>=0 || h.indexOf('_cf_chl_opt')>=0
+      || h.indexOf('cf_challenge_form')>=0 || h.indexOf('cf-turnstile')>=0;
+}catch(e){return true;}})()"#;
+
+fn eval_value(sess: &mut CdpPipe, sid: &str, expr: &str) -> Option<Value> {
+    sess.call(
+        Some(sid),
+        "Runtime.evaluate",
+        json!({ "expression": expr, "returnByValue": true }),
+    )
+    .ok()
+    .and_then(|r| r.pointer("/result/value").cloned())
+}
+
+fn browser_cookies(sess: &mut CdpPipe) -> Vec<Value> {
+    sess.call(None, "Storage.getCookies", json!({}))
+        .ok()
+        .and_then(|r| r.get("cookies").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// **Cloudflare challenge solver.** Navigate `url` in a confined Chromium, let the
+/// challenge run, and return the main-frame document the server sent once it clears.
+/// `deadline` is a hard wall clock (watchdog `killpg`, as `cdp_render`).
+///
+/// Never errors merely because the challenge was not cleared — an interactive Turnstile
+/// is expected to fail, and that is reported as `solved: false`. Err only for
+/// launch/protocol failure.
+pub fn cdp_solve_challenge(url: &str, page_host: &str, deadline: Duration) -> Result<SolveOutput> {
+    use crate::renderer::backend::CDN_PROXY_BYPASS;
+    use crate::renderer::proxy::{PolicyProxy, RenderPolicy};
+
+    let started = Instant::now();
+    let host = page_host.to_ascii_lowercase();
+    let allow = format!("{CDN_PROXY_BYPASS},{CF_CHALLENGE_HOSTS}");
+    let proxy = PolicyProxy::start_with_budget(RenderPolicy::new(&host, &allow), deadline);
+    let proxy_arg = proxy.proxy_arg();
+    let ua = solver_user_agent();
+    let ua_arg = format!("--user-agent={ua}");
+    let extra: Vec<&str> = vec![
+        &proxy_arg,
+        &ua_arg,
+        "--window-size=1280,800",
+        "--lang=en-GB",
+        "--disable-blink-features=AutomationControlled",
+    ];
+
+    let profile = unique_profile_dir();
+    let mut sess = match CdpPipe::launch(&profile, &extra) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = proxy.collect();
+            let _ = std::fs::remove_dir_all(&profile);
+            return Err(e);
+        }
+    };
+    let (done, watchdog) = spawn_watchdog(sess.pgid, deadline);
+    // Stop polling with enough slack left to read the result before the watchdog fires.
+    let poll_until = started + deadline.saturating_sub(Duration::from_millis(3000));
+
+    let result = (|| -> Result<SolveOutput> {
+        let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+        let target_id = created
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("no targetId"))?
+            .to_string();
+        let attached = sess.call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )?;
+        let sid = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("no sessionId"))?
+            .to_string();
+
+        // Retain response bodies so the document can be read after the challenge's own
+        // reload; bounded so a hostile page cannot pin unbounded browser memory.
+        sess.call(
+            Some(&sid),
+            "Network.enable",
+            json!({ "maxTotalBufferSize": 24 * 1024 * 1024, "maxResourceBufferSize": 8 * 1024 * 1024 }),
+        )?;
+        let mut docs = DocTracker::new(main_frame_id_from_target(&target_id));
+
+        // Reuse a clearance this Carapace earned earlier for the same host (same egress
+        // IP), so a repeat scan of a challenged site skips the challenge.
+        let injected = match (!host.is_empty()).then(|| cached_clearance(&host)).flatten() {
+            Some(cookies) => sess
+                .call(Some(&sid), "Network.setCookies", json!({ "cookies": cookies }))
+                .is_ok(),
+            None => false,
+        };
+
+        sess.call(Some(&sid), "Page.navigate", json!({ "url": url }))?;
+
+        let mut solved = false;
+        let mut challenge_absent = false;
+        let mut saw_challenge = false;
+        while Instant::now() < poll_until {
+            pump(&mut sess, SOLVE_POLL, &mut docs);
+            // Evaluate fails transiently while the challenge reloads the document
+            // ("execution context destroyed") — treat that as not-ready.
+            let ready = eval_value(&mut sess, &sid, "document.readyState")
+                .and_then(|v| v.as_str().map(|s| s == "complete"))
+                .unwrap_or(false);
+            if !ready {
+                continue;
+            }
+            // Success is decided by the two things the interstitial cannot fake at once:
+            // Cloudflare issued `cf_clearance`, and the document is no longer the
+            // "Just a moment..." page. The broader marker scan is NOT used here —
+            // measured on nowsecure.nl (2026-09-30), the real post-challenge page still
+            // matched it (a `.cf-turnstile` CSS rule), so gating success on it left a
+            // solved challenge polling to the deadline.
+            let interstitial_title = eval_value(&mut sess, &sid, "(document.title||'').toLowerCase()")
+                .and_then(|v| v.as_str().map(|t| t.contains("just a moment")))
+                .unwrap_or(true);
+            let has_clearance = browser_cookies(&mut sess)
+                .iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some("cf_clearance"));
+            if has_clearance && !interstitial_title {
+                solved = true;
+                break;
+            }
+            let challenged = interstitial_title
+                || eval_value(&mut sess, &sid, CHALLENGE_PRESENT_JS)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+            if challenged {
+                saw_challenge = true;
+                continue;
+            }
+            // Loaded, no interstitial, no clearance: the page was never challenged for
+            // this client. (A cleared challenge sets its cookie before it reloads.)
+            if !saw_challenge {
+                challenge_absent = true;
+                break;
+            }
+        }
+        if solved {
+            // Let the post-challenge document finish its own loading before reading it.
+            pump(&mut sess, Duration::from_millis(1000), &mut docs);
+        } else {
+            // A JavaScript gate navigates immediately, but the first poll can land on the
+            // gate document before its re-entry commits and report it challenge-absent.
+            // Give the gate time to play out so the chain and the landing document are
+            // what a visitor actually reaches, not the gate itself.
+            pump(&mut sess, Duration::from_millis(2500), &mut docs);
+        }
+        absorb(&mut sess, &mut docs);
+
+        let cookies = browser_cookies(&mut sess);
+        if solved && !host.is_empty() {
+            store_clearance(&host, &cookies);
+        } else if injected {
+            // The cached clearance was not accepted (VPN exit changed, or expired early).
+            drop_clearance(&host);
+        }
+        let mut cookie_names: Vec<String> = cookies
+            .iter()
+            .filter_map(|c| c.get("name").and_then(Value::as_str))
+            .filter(|n| CF_COOKIE_NAMES.contains(n))
+            .map(str::to_string)
+            .collect();
+        cookie_names.sort();
+        cookie_names.dedup();
+
+        let clearance_source = match (solved, saw_challenge, injected) {
+            (true, false, true) => "cached",
+            (true, _, _) => "fresh",
+            _ => "none",
+        }
+        .to_string();
+
+        // The document is only worth returning once the browser got past the gate.
+        let document = if solved || challenge_absent {
+            docs.last.take().and_then(|(rid, durl, status, hdrs)| {
+                let r = sess
+                    .call(Some(&sid), "Network.getResponseBody", json!({ "requestId": rid }))
+                    .ok()?;
+                let raw = r.get("body").and_then(Value::as_str).unwrap_or("");
+                let mut bytes = if r.get("base64Encoded").and_then(Value::as_bool).unwrap_or(false) {
+                    base64::engine::general_purpose::STANDARD.decode(raw).ok()?
+                } else {
+                    raw.as_bytes().to_vec()
+                };
+                let truncated = bytes.len() > MAX_DOC_BYTES;
+                bytes.truncate(MAX_DOC_BYTES);
+                Some(SolvedDocument {
+                    url: durl.chars().take(2048).collect(),
+                    status,
+                    headers: header_map(&hdrs),
+                    body_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    truncated,
+                })
+            })
+        } else {
+            None
+        };
+
+        let str_of = |v: Option<Value>| v.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        let final_url = str_of(eval_value(&mut sess, &sid, "location.href")).chars().take(2048).collect();
+        let title = str_of(eval_value(&mut sess, &sid, "document.title")).chars().take(512).collect();
+
+        Ok(SolveOutput {
+            solved,
+            challenge_absent,
+            clearance_source,
+            final_url,
+            title,
+            cookie_names,
+            user_agent: ua.to_string(),
+            document,
+            nav_chain: std::mem::take(&mut docs.nav_chain),
+            elapsed_ms: 0,
+            intercepted: Vec::new(),
+        })
+    })();
+
+    done.store(true, Ordering::Relaxed);
+    let _ = sess.call(None, "Browser.close", json!({}));
+    sess.kill();
+    let _ = watchdog.join();
+    let _ = std::fs::remove_dir_all(&profile);
+    let intercepted = proxy.collect();
+
+    result.map(|mut out| {
+        out.elapsed_ms = started.elapsed().as_millis() as u64;
+        // Chromium's own update/telemetry traffic is not the page's (see lib.rs).
+        out.intercepted = intercepted
+            .into_iter()
+            .filter(|u| !crate::is_browser_infrastructure(u))
+            .collect();
+        out
+    })
+}
+
 #[cfg(test)]
 mod cdp_spike_tests {
     use super::*;
@@ -950,6 +1497,130 @@ mod cdp_spike_tests {
         let len = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
         assert!(len > 0, "non-empty screenshot written to file");
         let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn solver_ua_has_no_headless_token() {
+        let ua = solver_user_agent();
+        assert!(!ua.contains("Headless"), "headless token must not leak: {ua}");
+        assert!(ua.contains("Chrome/") && ua.contains(".0.0.0"), "reduced-UA form: {ua}");
+    }
+
+    /// A page with no challenge comes back `challenge_absent`, not `solved`, reports no
+    /// Cloudflare cookies (a page's own cookies are never surfaced), and involves no
+    /// clearance.
+    #[test]
+    fn solver_reports_absent_challenge_on_plain_page() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping solver test: no chromium on this host");
+            return;
+        }
+        let url = "data:text/html,<html><head><title>Plain</title></head><body>hi\
+                   <script>document.cookie='tracker=1';</script></body></html>";
+        let out = cdp_solve_challenge(url, "", Duration::from_secs(15)).expect("solve");
+        assert!(!out.solved, "nothing to solve");
+        assert!(out.challenge_absent, "plain page is challenge-absent");
+        assert!(out.cookie_names.is_empty(), "non-Cloudflare cookies are never surfaced");
+        assert_eq!(out.clearance_source, "none");
+        assert_eq!(out.title, "Plain");
+    }
+
+    /// An interstitial that never clears must time out as unsolved — not hang, not
+    /// error — inside the deadline, and must return no document.
+    #[test]
+    fn solver_gives_up_on_uncleared_challenge() {
+        if chromium_bin().is_none() {
+            eprintln!("skipping solver test: no chromium on this host");
+            return;
+        }
+        let url = "data:text/html,<html><head><title>Just a moment...</title></head>\
+                   <body><script>window._cf_chl_opt={};</script></body></html>";
+        let start = Instant::now();
+        let out = cdp_solve_challenge(url, "", Duration::from_secs(6)).expect("solve");
+        assert!(!out.solved && !out.challenge_absent);
+        assert!(out.document.is_none(), "an uncleared interstitial is never returned as the page");
+        assert!(start.elapsed() < Duration::from_secs(9), "bounded by the deadline");
+    }
+
+    /// Only the MAIN frame's documents are tracked, and the last one wins (after a
+    /// challenge clears, that is the real page, not the interstitial).
+    #[test]
+    fn doc_tracker_keeps_last_main_frame_document_only() {
+        let ev = |frame: &str, rtype: &str, rid: &str, url: &str| json!({
+            "method": "Network.responseReceived",
+            "params": { "requestId": rid, "frameId": frame, "type": rtype,
+                        "response": { "url": url, "status": 200, "headers": {"server": "cloudflare"} } }
+        });
+        let mut t = DocTracker::new("MAIN".into());
+        t.observe(&ev("MAIN", "Document", "1", "https://site.test/"));          // interstitial
+        t.observe(&ev("TURNSTILE", "Document", "2", "https://challenges.cloudflare.com/x"));
+        t.observe(&ev("MAIN", "Script", "3", "https://site.test/app.js"));
+        t.observe(&ev("MAIN", "Document", "4", "https://site.test/"));          // real page
+        let (rid, url, status, _) = t.last.expect("tracked");
+        assert_eq!((rid.as_str(), url.as_str(), status), ("4", "https://site.test/", 200));
+    }
+
+    /// The navigation chain records main-frame Document requests in order — server
+    /// redirects and a cross-origin hop included — and nothing from sub-frames or
+    /// subresources.
+    #[test]
+    fn doc_tracker_records_main_frame_nav_chain() {
+        let req = |frame: &str, rtype: &str, url: &str| json!({
+            "method": "Network.requestWillBeSent",
+            "params": { "frameId": frame, "type": rtype, "request": { "url": url } }
+        });
+        let mut t = DocTracker::new("MAIN".into());
+        t.observe(&req("MAIN", "Document", "https://gate.test/"));
+        t.observe(&req("MAIN", "Script", "https://gate.test/a.js"));
+        t.observe(&req("MAIN", "Document", "https://gate.test/?ch=1&js=tok"));
+        t.observe(&req("MAIN", "Document", "https://gate.test/?ch=1&js=tok")); // repeat
+        t.observe(&req("FRAME", "Document", "https://iframe.test/"));
+        t.observe(&req("MAIN", "Document", "http://tds.test/click?i=1"));
+        t.observe(&req("MAIN", "Document", "chrome-error://chromewebdata/"));
+        assert_eq!(t.nav_chain, vec![
+            "https://gate.test/", "https://gate.test/?ch=1&js=tok", "http://tds.test/click?i=1",
+        ]);
+    }
+
+    /// The clearance cache keeps only Cloudflare cookies scoped to the host, requires a
+    /// cf_clearance, and honours a near expiry.
+    #[test]
+    fn clearance_cache_scoping_and_expiry() {
+        let far = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 86_400) as f64;
+        let c = |name: &str, domain: &str, exp: f64| json!({
+            "name": name, "value": "v1", "domain": domain, "path": "/", "expires": exp,
+            "secure": true, "httpOnly": true
+        });
+        let host = "cache-test-a.example";
+        store_clearance(host, &[
+            c("cf_clearance", ".cache-test-a.example", far),
+            c("__cf_bm", ".cache-test-a.example", far),
+            c("session", ".cache-test-a.example", far),       // not Cloudflare's
+            c("_cfuvid", ".other.example", far),               // another site's
+        ]);
+        let got = cached_clearance(host).expect("cached");
+        let names: Vec<&str> = got.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["cf_clearance", "__cf_bm"]);
+
+        // No cf_clearance -> nothing cached.
+        store_clearance("cache-test-b.example", &[c("__cf_bm", ".cache-test-b.example", far)]);
+        assert!(cached_clearance("cache-test-b.example").is_none());
+
+        // Expiring inside the 60s safety margin -> not cached.
+        let soon = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 30) as f64;
+        store_clearance("cache-test-c.example", &[c("cf_clearance", ".cache-test-c.example", soon)]);
+        assert!(cached_clearance("cache-test-c.example").is_none());
+
+        drop_clearance(host);
+        assert!(cached_clearance(host).is_none());
+    }
+
+    #[test]
+    fn cookie_domain_match_is_rfc6265() {
+        assert!(cookie_domain_matches(".example.com", "www.example.com"));
+        assert!(cookie_domain_matches("example.com", "example.com"));
+        assert!(!cookie_domain_matches("example.com", "notexample.com"));
+        assert!(!cookie_domain_matches(".com", "example.com"), "bare TLD never matches");
     }
 
     #[test]
