@@ -4,7 +4,9 @@
 <img src="images/Carapace_logo.png" width="400" alt="Carapace" border-radius=50%>
 </p>
 
-Safe HTML/CSS/JS renderer for security researchers. Carapace fetches a URL, sanitises the page, analyses the JavaScript, and renders it to a PNG — with all outbound network requests intercepted and blocked. A threat report is produced alongside every render.
+Confined HTML/CSS/JS renderer for security researchers. Carapace loads a URL in headless Chromium **with JavaScript enabled** — so runtime-injected attacks (ClickFix, SocGholish, ClearFake, drainers) actually render — behind an SSRF-enforcing policy proxy: the page's own same-origin content loads live, and every cross-origin request (the C2 / exfiltration signal) is refused and recorded. A threat report is produced alongside every render. A `/solve` endpoint gets past Cloudflare challenges and JavaScript cloaking gates and returns the page the server actually served.
+
+Carapace is the renderer behind [Insight](https://insight.vault1337.com/).
 
 ---
 
@@ -15,25 +17,30 @@ Safe HTML/CSS/JS renderer for security researchers. Carapace fetches a URL, sani
 3. **Static JS analysis** — All collected script content is walked with an AST analyser (OXC) before removal. Detects eval, obfuscation, exfiltration calls, DOM sinks, clipboard hijacks, and sandbox evasion probes.
 4. **JS sandbox** — For framework-driven pages (React, Vue, Angular, etc.), scripts are executed in an isolated rquickjs runtime. Network APIs are shimmed to log and block all outbound calls.
 5. **Inline resources** — External stylesheets and images are fetched and inlined as data URIs. External `url()` references in CSS are blocked.
-6. **Render** — A self-contained HTML file is handed to Chromium headless with **JavaScript enabled** and all network requests routed through a local logging proxy. The proxy records every URL the page attempts to reach and immediately rejects the connection — no data leaves the machine. This allows dynamic overlays (ClickFix, SocGholish, ClearFake, drainers) to render and be visible in the screenshot.
-7. **Threat report** — All findings from static analysis, the JS sandbox, the CSS overlay detector, the post-render DOM diff, and the network intercept log are collected into a JSON report alongside the screenshot.
-8. **Annotation** — A verdict badge is composited onto the bottom of every screenshot showing the domain, risk score, verdict label, and scan timestamp.
+6. **Render (live)** — Chromium headless navigates the **real URL** with **JavaScript enabled** — driven over the Chrome DevTools Protocol through a pipe (`--remote-debugging-pipe`, no debug port a page could reach) when `CARAPACE_CDP` is on, otherwise via Chromium's CLI. All traffic goes through the **policy proxy**: the page's own host and a vetted CDN/font list are fetched live, with every resolved IP SSRF-checked; cross-origin requests are refused and recorded. A Windows identity is presented so OS-gated payloads execute, navigation is suppressed so the attack UI stays on screen, and the page settles on network-idle (floored so delayed overlays still inject) before the screenshot and post-JS DOM are captured.
+7. **Navigation capture** (`CARAPACE_CDP_NAV_CAPTURE`) — Main-frame navigations are intercepted with CDP `Fetch` (Document only): the first is the validated page load and continues; every later one is a client-side redirect whose JS-computed destination is recorded and blocked, never dispatched. Destinations are returned as `nav_targets` for the caller to SSRF-validate and scan.
+8. **Offline fallback** — If the live render fails or comes back blank, the self-contained sanitised HTML (steps 2–5) is rendered with a proxy that refuses every connection and a `fetch`/`XMLHttpRequest` mock, so data-driven pages still show something.
+9. **Threat report** — All findings from static analysis, the JS sandbox, the CSS overlay detector, the post-render DOM diff, and the network intercept log are collected into a JSON report alongside the screenshot.
+10. **Annotation** — A verdict badge is composited onto the bottom of every screenshot showing the domain, risk score, verdict label, and scan timestamp.
 
 ---
 
 ## Security model
 
-- All outbound connections from Chromium are routed through a local logging proxy that immediately rejects every connection — no data ever leaves the machine
-- The proxy records every URL Chromium attempted to reach at runtime; these appear as `INTERCEPTED_REQUEST` findings in the threat report
+Carapace **executes attacker JavaScript**, so the browser is treated as hostile and the container is the trust boundary:
+
+- **Policy proxy** — every Chromium connection goes through it. Same-origin (the page's own host and subdomains) and a vetted read-only CDN/font list are forwarded; everything else is refused with a 503 and recorded (`INTERCEPTED_REQUEST`). The proxy resolves each host itself and rejects the connection if **any** resolved IP is private, loopback, link-local, metadata or CGNAT — which also defeats DNS rebinding. Forwarded connections are bounded in count, time and bytes.
+- **Control channel** — CDP runs over `--remote-debugging-pipe`, never a TCP port, so the page cannot reach it. Event domains that an adversarial page could flood are kept off or drained with bounded queues.
+- **Hard deadlines** — each browser runs in its own process group with a watchdog that `killpg`s it at the deadline; a hung or hostile page cannot outlive its budget.
+- **Memory bounds** — one renderer process per page, a capped V8 heap, and `oom_score_adj=1000` so a runaway page loses its own browser rather than the server.
+- **Isolation between renders** — a fresh browser process and private profile per render.
 - `--disable-blink-features=AutomationControlled` suppresses the `navigator.webdriver` flag so evasive scripts execute their actual attack path rather than a clean scanner path
-- `--virtual-time-budget=5000` allows JS timers up to 5 seconds to fire before the screenshot is taken, catching attacks that delay their overlay to evade scanners
+- On the offline path, `--virtual-time-budget=5000` lets JS timers up to 5 seconds fire before the screenshot, catching attacks that delay their overlay to evade scanners
 - `--run-all-compositor-stages-before-draw` ensures layout, paint, and compositing complete before the PNG is captured, preventing partial blank renders
-- Remote fonts are blocked (`--disable-remote-fonts`)
-- CSS `@import`, external `url()`, and `@font-face` are stripped before injection into the browser
-- The HTML sanitiser removes every `on*` attribute, `<script>`, `<iframe>`, `<object>`, `<embed>`, and `<form>` before the page is handed to Chromium
+- Offline path only (the live render loads the real page through the policy proxy instead): remote fonts are blocked (`--disable-remote-fonts`); CSS `@import`, external `url()`, and `@font-face` are stripped; and the HTML sanitiser removes every `on*` attribute, `<script>`, `<iframe>`, `<object>`, `<embed>`, and `<form>` before the self-contained page is handed to Chromium
 - SSRF protection blocks private, loopback, and link-local IP ranges at both URL-validation and DNS-resolution time
 - The rquickjs JS sandbox shims `fetch`, `XMLHttpRequest`, and `WebSocket` — all network calls are logged and blocked
-- Docker: runs as a non-root user (uid 1000), all Linux capabilities dropped
+- Docker: runs as a non-root user (uid 1000), all Linux capabilities dropped. In production also run it with `--read-only` (tmpfs for `/tmp`, `/home/carapace`, `/output`), `--init` (reaps Chromium's child processes), bounded memory/CPU/PIDs, and on a network that cannot reach anything but the internet — Insight runs it inside a VPN namespace attached to a render-only network, with a host egress firewall dropping private ranges
 - `wkhtmltoimage` fallback uses `--disable-javascript`
 
 ---
@@ -197,6 +204,52 @@ Either `url` or `content` must be provided. `content` takes precedence if both a
 
 **Response:** same shape as `/render` with `output: null` and `mobile_output: null`; only `threat_report` is populated.
 
+### `POST /solve`
+
+Loads a URL in the confined browser, lets whatever gate stands in front of the content play out, and returns **the document the server actually served** plus the path the browser was sent down. Two uses:
+
+- **Cloudflare bot challenges** that a plain or TLS-impersonating client cannot pass. The policy proxy additionally allows `challenges.cloudflare.com` (Turnstile); the User-Agent is Chromium's own with the `HeadlessChrome` token removed, set by flag so the Sec-CH-UA client hints stay native and consistent.
+- **JavaScript cloaking gates** — a content-less page that re-requests itself with a proof-of-JS token, after which the server picks what to serve. No render bootstrap is injected, so the gate's own navigation fires. If the gate forwards off-site (a TDS doorway), the cross-origin hop is **recorded in `nav_chain` but not fetched** — the policy proxy still refuses it.
+
+```bash
+curl -s -X POST http://localhost:8080/solve -H "Content-Type: application/json" -H "X-API-Key: s3cr3t" \
+  -d '{"url":"https://example.com/"}'
+```
+
+Request: `{"url": "https://..."}` — http(s) only (https-only when the server enforces it), a hostname rather than an IP literal, no credentials in the URL.
+
+**Response:**
+
+```json
+{
+  "solved": true,
+  "challenge_absent": false,
+  "clearance_source": "fresh",
+  "final_url": "https://example.com/",
+  "title": "Example",
+  "cookie_names": ["cf_clearance"],
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) ... Chrome/151.0.0.0 Safari/537.36",
+  "document": {
+    "url": "https://example.com/",
+    "status": 200,
+    "headers": { "content-type": "text/html; charset=utf-8", "server": "cloudflare" },
+    "body_b64": "<base64 raw response body>",
+    "truncated": false
+  },
+  "nav_chain": ["https://example.com/", "https://example.com/?__cf_chl_tk=..."],
+  "elapsed_ms": 3162,
+  "intercepted": []
+}
+```
+
+- `solved` — `cf_clearance` was issued **and** the "Just a moment…" interstitial is gone. `challenge_absent` — the page loaded without any challenge (or a JS gate was followed). An interactive Turnstile that cannot be passed returns both `false`, never an error.
+- `document` — the last **main-frame** response the browser received (sub-frames such as the Turnstile iframe are ignored), captured over CDP `Network`: raw body (base64, capped at 5 MB) and headers. `null` if it could not be captured, and never returned for an uncleared interstitial.
+- `nav_chain` — ordered main-frame navigations (≤10, http/https), server redirects included.
+- `clearance_source` — `fresh`, `cached`, or `none`. Clearance cookies are cached **per host inside Carapace** (≤25 min) and fed back into the next solve's browser before it navigates, so a repeat request skips the challenge. **Clearance values never leave Carapace** — only `cookie_names` are returned. Returning the page rather than cookies also matters when the caller's egress IP differs from Carapace's: clearance is bound to the IP that solved it.
+- The response is produced by a browser that has just run the target's JavaScript — callers must treat every field as untrusted input.
+
+A solve holds a render slot and is capped at 25 seconds.
+
 ---
 
 ## Threat report
@@ -217,6 +270,8 @@ Every render produces a threat report. When using the CLI it is written to `<out
   "rendered_html": "",
   "normalized_scripts": [],
   "decoded_payloads": [],
+  "runtime_scripts": [],
+  "nav_targets": [],
   "html_flags": [],
   "js_flags": [],
   "blocked_network": [],
@@ -235,6 +290,21 @@ Every render produces a threat report. When using the CLI it is written to `<out
 **`render_mode`** records which strategy produced the delivered screenshot: `"live"` (navigated the real URL through the same-origin proxy), `"offline_fallback"` (live render failed or came back blank → offline self-contained render), or `"offline"` (live disabled). **`render_blank`** is `true` when the delivered screenshot is effectively all near-white pixels after the retry ladder was exhausted, and **`blank_ratio`** (0.0–1.0) is the near-white pixel fraction behind that decision.
 
 **`rendered_html`** is the post-JS DOM of a successful live render (capped for transport), letting a caller re-run the analysers on what the browser actually rendered — essential for service-worker-gated content (IPFS `dweb.link`) and fully JS-rendered SPAs. **`normalized_scripts`** (Tier-0 deobfuscation: constants folded) and **`decoded_payloads`** (Tier-2: cleartext captured from `eval`/`Function`/`document.write` sinks while the script's own decoder ran) expose the resolved payload behind obfuscation.
+
+**`nav_targets`** are main-frame redirect destinations captured (and blocked, never dispatched) on a live render — including JS-computed interstitial/TDS destinations no static analysis can resolve (≤10; enabled by `CARAPACE_CDP_NAV_CAPTURE`). The caller SSRF-validates them before following. **`runtime_scripts`** are bodies of scripts loaded at runtime via `fetch()+eval` or dynamic `import()` that never appear as `<script>` tags (enabled by `CARAPACE_CDP_CAPTURE`).
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `CARAPACE_API_KEY` | none | Same as `--api-key` |
+| `CARAPACE_CDP` | off (Insight sets `1`) | Live render driven over CDP in one browser session. Off: the live render uses Chromium's CLI (`--screenshot` / `--dump-dom`) through the same policy proxy |
+| `CARAPACE_CDP_NAV_CAPTURE` | off (Insight sets `1`) | Capture main-frame redirect destinations (`nav_targets`) via CDP `Fetch` interception. Requires `CARAPACE_CDP` |
+| `CARAPACE_CDP_CAPTURE` | off | Capture runtime-loaded script bodies (`runtime_scripts`) via CDP `Network`. Requires `CARAPACE_CDP` |
+
+Flags accept `1`, `true` or `on`. `/solve` always uses CDP, whatever these are set to.
 
 ### Flag codes
 
@@ -294,7 +364,7 @@ Detection covers: React, Vue, Angular, Svelte, Next.js, Nuxt, HTMX, Alpine.js, L
 
 ## Renderer fallback
 
-The primary render path is Chromium headless with JavaScript enabled and a logging network proxy. If Chromium is not available, Carapace falls back to `wkhtmltoimage` with JavaScript disabled.
+The render ladder is: **live render** (the real URL, JavaScript enabled, through the policy proxy — over CDP when `CARAPACE_CDP` is on, with the CLI live render as its fallback) → **offline render** of the sanitised self-contained page (JavaScript enabled, every connection refused, network mocked) when the live render fails or comes back blank (`render_mode` records which one produced the screenshot). If Chromium is not available, Carapace falls back to `wkhtmltoimage` with JavaScript disabled.
 
 Pass `--no-browser` to force the built-in Rust renderer (tiny-skia + taffy layout engine). The Rust renderer is approximate — it handles basic CSS box model, flexbox, and inline text but does not support all CSS features. Use it only when no headless browser is available.
 

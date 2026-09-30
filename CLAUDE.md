@@ -2,9 +2,13 @@
 
 ## Project Overview
 Carapace is a safe HTML/CSS/JS renderer built in Rust for security researchers.
-It fetches a URL and renders it to PNG/PDF without executing malicious code.
-The primary render path uses Chromium headless with JS disabled and a network
-kill-switch; a built-in Rust renderer is available as a fallback (`--no-browser`).
+It renders a URL in headless Chromium **with JavaScript enabled** — attacker code
+runs, so the container is the trust boundary — behind an SSRF-enforcing policy
+proxy (same-origin + vetted CDNs live; cross-origin refused and recorded). Live
+render is over CDP when `CARAPACE_CDP=1` (Insight's setting); an offline render of
+the sanitised page, `wkhtmltoimage`, and a built-in Rust renderer (`--no-browser`)
+are the fallbacks. `/solve` gets past Cloudflare challenges and JS cloaking gates
+and returns the served document + navigation chain. See README.md.
 
 **Native (development)**
 ```bash
@@ -88,22 +92,19 @@ src/
     mod.rs         — ThreatReport; flag dedup, volume scoring, drive-by detection
 ```
 
-## Documentation Index
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/architecture.md) | System design, data flow, module interactions |
-| [HTTP API](docs/api.md) | API endpoints, request/response schema, Insight integration |
-| [Docker Deployment](docs/docker.md) | Container build, security flags, production usage |
-| [HTTP Fetcher](docs/http-fetcher.md) | SSRF protection, DNS validation, decompression limits |
-| [HTML Sanitizer](docs/html-sanitizer.md) | Blocked tags, attributes, URL schemes, bypass research |
-| [JS Runtime](docs/js-runtime.md) | rquickjs sandbox, execution model, intercepted globals |
-| [Virtual DOM](docs/virtual-dom.md) | JS-visible API surface, intercepted calls, state extraction |
-| [CSS Processing](docs/css-processing.md) | SCSS, Less sandboxing, Tailwind class extraction |
-| [Threat Report](docs/threat-report.md) | Output schema, flag taxonomy, JSON structure |
-| [Rendering](docs/rendering.md) | Layout pipeline, font loading, PNG/PDF output |
+## Documentation
+There is no `docs/` directory in this repo (the index that used to live here pointed
+at files that were never committed). The references are:
+
+| Document | Covers |
+|----------|--------|
+| [README.md](README.md) | How it works, security model, CLI, HTTP API (`/render`, `/analyse`, `/solve`), threat-report schema + flag codes, env vars, render ladder |
+| Insight `docs/research-carapace-rendering-2026.md` | Live-navigation policy proxy, blank detection, CDP design |
+| Insight `docs/research-carapace16-nav-capture-2026.md` | CDP `Fetch` nav capture (`nav_targets`) |
+| Insight `docs/research-large-js-deobfuscation-2026.md` | Deobfuscation ladder (oxc folding, QuickJS sink capture) |
+| Insight `docs/detection-engine.md` | How Insight consumes Carapace flags; JS-gate following via `/solve` |
 
 ## Workflow Notes
-- Update the relevant doc whenever a module's behaviour changes
-- When adding a new module, create its doc and add a row to this index
-- Threat report schema changes must be reflected in `docs/threat-report.md`
+- Update README.md whenever an endpoint, flag, env var or threat-report field changes
+- Threat report schema changes must be reflected in README.md's Threat report section
 - New blocked patterns (sanitizer, SSRF) must include a regression test
