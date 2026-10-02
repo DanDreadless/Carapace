@@ -38,10 +38,11 @@ grass = { version = "0.13.4", default-features = false }
 
 # ── JS Static Analysis ────────────────────────────────────────────────────────
 # These crates release frequently — all pinned to the versions in Cargo.lock.
-oxc_allocator = "0.39.0"
-oxc_parser    = "0.39.0"
-oxc_ast       = "0.39.0"
-oxc_span      = "0.39.0"
+oxc_allocator = "0.152.0"
+oxc_parser    = "0.152.0"
+oxc_ast       = "0.152.0"
+oxc_ast_visit = "0.152.0"
+oxc_span      = "0.152.0"
 
 # ── JS Sandbox Runtime ────────────────────────────────────────────────────────
 rquickjs = { version = "0.8.1", features = ["full", "loader"] }

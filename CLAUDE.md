@@ -55,7 +55,9 @@ docker run --rm \
 - No `unwrap()`/`expect()` outside unit tests — always propagate with `?`
 - Use `tracing::{info, warn, error, debug, span}` for all diagnostics
 - Security-critical paths (SSRF, sanitizer, JS interception) require unit tests
-- `cargo clippy -- -D warnings` must be clean before merging
+- `cargo clippy -- -D warnings` must be clean before merging. **Known debt (2026-10-03):** 19 pre-existing lints in modules outside `js/` (css, fetcher/ssrf, html/sanitizer, layout, renderer/*, runtime) predate the oxc 0.152 upgrade and fail this rule. Do not add to them; clear them in a dedicated change.
+- **Toolchain:** Rust **1.96** (Dockerfile `rust:1.96-slim-bookworm`), the MSRV of oxc 0.152. Build locally with `cargo +1.96 …` until the host's stable reaches 1.96.
+- **Parser / runtime upgrades (oxc, rquickjs, Rust) must prove no detection change.** Build `examples/js_differential.rs` at the old and new commit, run both over the same corpus (Insight's clean-snapshot scripts + inline scripts + `threat_fixtures` JS), and require byte-identical JSONL. Flags are sorted. The baseline is deterministic (verified identical across two runs), so any diff is real. The oxc 0.39 → 0.152 upgrade was verified this way on 1,994 scripts.
 - Keep modules single-concern; prefer many small files over large ones
 - Document public structs/fns with `///`; skip obvious internals
 
@@ -75,7 +77,7 @@ src/
     inliner.rs     — HtmlInliner; removes <link>, inlines CSS + images, serializes DOM
   js/
     mod.rs         — JsProcessor; static-analysis + runtime dispatch
-    analysis.rs    — oxc_parser AST walker; extracts DOM mutations, fetches, obfuscation
+    analysis.rs    — oxc_parser AST walker (oxc 0.152; `Visit` lives in `oxc_ast_visit`); extracts DOM mutations, fetches, obfuscation
     runtime.rs     — rquickjs sandbox setup + execution loop
     vdom.rs        — Virtual DOM state + JS-facing API stubs
   css/

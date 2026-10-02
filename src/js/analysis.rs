@@ -1,7 +1,7 @@
 use base64::Engine;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
-use oxc_ast::visit::{walk, Visit};
+use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use regex::Regex;
@@ -17,11 +17,11 @@ pub fn analyse(source: &str, source_name: &str, report: &mut ThreatReport) {
     let source_type = SourceType::default().with_script(true);
     let result = Parser::new(&allocator, source, source_type).parse();
 
-    if !result.errors.is_empty() {
+    if result.diagnostics.has_errors() {
         debug!(
             "{}: {} parse error(s) — continuing analysis on partial AST",
             source_name,
-            result.errors.len()
+            result.diagnostics.errors().count()
         );
     }
 
@@ -363,7 +363,7 @@ impl<'a> Visit<'a> for SecurityVisitor<'_> {
                     let is_negated = start > 0 && src.as_bytes().get(start - 1).copied() == Some(b'!');
                     let window_start = start.saturating_sub(20);
                     let window_end = (end + 20).min(src.len());
-                    let has_and_chain = src.get(window_start..window_end).map_or(false, |w| w.contains("&&"));
+                    let has_and_chain = src.get(window_start..window_end).is_some_and(|w| w.contains("&&"));
                     if self.has_user_agent_check && is_negated && has_and_chain {
                         // Framer URL-param preservation: !navigator.webdriver && !botUA — not cloaking.
                     } else if probe_gates_content(src, start, end) {

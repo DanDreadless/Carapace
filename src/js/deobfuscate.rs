@@ -19,7 +19,7 @@
 use base64::Engine;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
-use oxc_ast::visit::{walk, Visit};
+use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -88,8 +88,8 @@ fn collect_edits(source: &str) -> Vec<Edit> {
     let source_type = SourceType::default().with_script(true);
     let ret = Parser::new(&allocator, source, source_type).parse();
 
-    // A panicked parse leaves spans we cannot trust for splicing.
-    if ret.panicked {
+    // A fatal parse error (formerly `panicked`) leaves spans we cannot trust for splicing.
+    if ret.fatal_error {
         return Vec::new();
     }
 
@@ -101,7 +101,7 @@ fn collect_edits(source: &str) -> Vec<Edit> {
 /// Apply non-overlapping edits to `source`, returning the rewritten string.
 fn apply_edits(source: &str, mut edits: Vec<Edit>, total_folds: &mut usize) -> String {
     // Apply right-to-left so earlier offsets stay valid.
-    edits.sort_by(|a, b| b.start.cmp(&a.start));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut out = source.to_string();
     let mut last_applied_start = u32::MAX; // guard against overlapping spans
     for e in edits {

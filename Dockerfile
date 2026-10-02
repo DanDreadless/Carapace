@@ -5,7 +5,7 @@
 # BuildKit cache mounts keep the registry and build artefacts warm across
 # rebuilds so re-compiling after a source change is fast.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.96-slim-bookworm AS builder
 
 WORKDIR /build
 
