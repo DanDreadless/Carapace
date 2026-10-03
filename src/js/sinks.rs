@@ -158,14 +158,41 @@ struct SinkVisitor<'s, 'a> {
 struct Resolved {
     text: String,
     complete: bool,
+    /// The text starts / ends with an `EXPR` hole (tracked structurally so adjacent
+    /// holes collapse into one without ever rewriting a literal that contains "EXPR").
+    starts_hole: bool,
+    ends_hole: bool,
 }
 
 impl Resolved {
     fn hole() -> Self {
-        Self { text: EXPR.to_string(), complete: false }
+        Self { text: EXPR.to_string(), complete: false, starts_hole: true, ends_hole: true }
     }
     fn lit(s: &str) -> Self {
-        Self { text: s.to_string(), complete: true }
+        Self { text: s.to_string(), complete: true, starts_hole: false, ends_hole: false }
+    }
+    fn empty() -> Self {
+        Self::lit("")
+    }
+    /// Concatenate, collapsing a hole that meets a hole (`EXPR` + `EXPR` → `EXPR`).
+    fn concat(mut self, r: Resolved) -> Resolved {
+        if self.text.is_empty() {
+            return r;
+        }
+        if r.text.is_empty() {
+            return self;
+        }
+        if self.ends_hole && r.starts_hole {
+            self.text.push_str(&r.text[EXPR.len()..]);
+        } else {
+            self.text.push_str(&r.text);
+        }
+        Resolved {
+            text: self.text,
+            complete: self.complete && r.complete,
+            starts_hole: self.starts_hole,
+            ends_hole: r.ends_hole,
+        }
     }
 }
 
@@ -205,25 +232,21 @@ impl<'s, 'a> SinkVisitor<'s, 'a> {
             Expression::StringLiteral(s) => Resolved::lit(s.value.as_str()),
             Expression::NumericLiteral(n) => Resolved::lit(&number_text(n.value)),
             Expression::TemplateLiteral(t) => {
-                let mut text = String::new();
-                let mut complete = true;
+                let mut acc = Resolved::empty();
                 for (i, q) in t.quasis.iter().enumerate() {
-                    match &q.value.cooked {
-                        Some(c) => text.push_str(c.as_str()),
-                        None => text.push_str(q.value.raw.as_str()),
-                    }
+                    let quasi = match &q.value.cooked {
+                        Some(c) => c.as_str(),
+                        None => q.value.raw.as_str(),
+                    };
+                    acc = acc.concat(Resolved::lit(quasi));
                     if let Some(x) = t.expressions.get(i) {
-                        let r = self.resolve(x, depth);
-                        complete &= r.complete;
-                        text.push_str(&r.text);
+                        acc = acc.concat(self.resolve(x, depth));
                     }
                 }
-                Resolved { text, complete }
+                acc
             }
             Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
-                let l = self.resolve(&b.left, depth);
-                let r = self.resolve(&b.right, depth);
-                Resolved { text: l.text + &r.text, complete: l.complete && r.complete }
+                self.resolve(&b.left, depth).concat(self.resolve(&b.right, depth))
             }
             Expression::ParenthesizedExpression(p) => self.resolve(&p.expression, depth),
             Expression::Identifier(id) if depth < MAX_RESOLVE_DEPTH => {
@@ -481,6 +504,16 @@ mod tests {
         let ix = index(r#"const id = "42"; new WebSocket(`wss://c2.example/s/${id}/${Date.now()}`);"#);
         assert_eq!(ix.sinks[0].arg.as_deref(), Some("wss://c2.example/s/42/EXPR"));
         assert_eq!(ix.endpoints, vec!["wss://c2.example/s/42/EXPR".to_string()]);
+    }
+
+    #[test]
+    fn adjacent_holes_collapse_but_literals_are_untouched() {
+        let ix = index(r#"fetch("https://t.example/g?id=" + a + b + "&x=" + c); fetch("https://t.example/EXPREXPR");"#);
+        let args: Vec<_> = ix.sinks.iter().map(|s| s.arg.clone().unwrap_or_default()).collect();
+        assert_eq!(args[0], "https://t.example/g?id=EXPR&x=EXPR");
+        // A literal that happens to contain the placeholder text is never rewritten.
+        assert_eq!(args[1], "https://t.example/EXPREXPR");
+        assert!(ix.sinks[1].complete);
     }
 
     #[test]
