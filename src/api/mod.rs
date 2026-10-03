@@ -12,6 +12,7 @@
 /// Concurrency is bounded by `--max-concurrent` (default 4). Excess requests
 /// receive 429 Too Many Requests immediately rather than queuing.
 pub mod handlers;
+pub mod triage;
 
 use std::sync::Arc;
 
@@ -29,6 +30,9 @@ use crate::error::CarapaceError;
 pub struct AppState {
     /// Limits the number of render jobs running in parallel.
     pub semaphore: Semaphore,
+    /// Separate limit for `/triage`: static, millisecond-scale work that must neither
+    /// queue behind a render nor delay one.
+    pub triage_semaphore: Semaphore,
     /// If `Some`, every request must supply a matching `X-API-Key` header.
     pub api_key: Option<String>,
     /// Forwarded to each `RenderArgs` — callers cannot override this.
@@ -45,6 +49,7 @@ pub struct AppState {
 pub async fn serve(args: ServeArgs) -> Result<()> {
     let state = Arc::new(AppState {
         semaphore: Semaphore::new(args.max_concurrent),
+        triage_semaphore: Semaphore::new(2),
         api_key: args.api_key.clone(),
         block_private_ips: args.block_private_ips,
         https_only: args.https_only,
@@ -56,6 +61,7 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
         .route("/solve", post(handlers::solve))
         .route("/health", get(handlers::health))
         .route("/analyse", post(handlers::analyse))
+        .route("/triage", post(triage::triage))
         .with_state(state)
         // Body limit: /render and /health only need tiny payloads (a URL string).
         // /analyse accepts raw JS content up to 2 MB + JSON envelope overhead, so

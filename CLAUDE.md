@@ -79,6 +79,7 @@ src/
     mod.rs         — JsProcessor; static-analysis + runtime dispatch
     analysis.rs    — oxc_parser AST walker (oxc 0.152; `Visit` lives in `oxc_ast_visit`); extracts DOM mutations, fetches, obfuscation
     runtime.rs     — rquickjs sandbox setup + execution loop
+    sinks.rs       — sink index (/triage): dangerous ops, resolved args (oxc_semantic), enclosing-function spans
     vdom.rs        — Virtual DOM state + JS-facing API stubs
   css/
     mod.rs         — CssProcessor; parse, var resolution, sanitize_css_for_browser
@@ -90,6 +91,7 @@ src/
   api/
     mod.rs         — axum router, AppState, serve() entry point
     handlers.rs    — RenderRequest/RenderResponse types, render + health handlers
+    triage.rs      — POST /triage (content-only, own semaphore) → js::sinks::index
   threat/
     mod.rs         — ThreatReport; flag dedup, volume scoring, drive-by detection
 ```

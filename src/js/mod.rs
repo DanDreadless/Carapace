@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod deobfuscate;
 pub mod runtime;
+pub mod sinks;
 pub mod vdom;
 
 use std::time::{Duration, Instant};

