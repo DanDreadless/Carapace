@@ -96,19 +96,11 @@ fn check_ipv6(ip: &Ipv6Addr) -> Result<()> {
 
     // ::ffff:0:0/96 (IPv4-mapped) and ::/96 (IPv4-compatible, deprecated) —
     // re-validate the embedded IPv4 address.
-    // NOTE: 64:ff9b::/96 (NAT64) is NOT covered here despite earlier comments; it
-    // needs its own prefix check (tracked separately — a behaviour change, kept out
-    // of the lint-only commit).
     if segs[0] == 0 && segs[1] == 0 && segs[2] == 0
         && segs[3] == 0 && segs[4] == 0
         && (segs[5] == 0xFFFF || segs[5] == 0)
     {
-        let v4 = Ipv4Addr::new(
-            (segs[6] >> 8) as u8,
-            (segs[6] & 0xFF) as u8,
-            (segs[7] >> 8) as u8,
-            (segs[7] & 0xFF) as u8,
-        );
+        let v4 = embedded_v4(segs[6], segs[7]);
         // Only check if non-zero (avoids false positive on ::)
         if !v4.is_unspecified() {
             return check_ipv4(&v4).map_err(|_| {
@@ -117,12 +109,53 @@ fn check_ipv6(ip: &Ipv6Addr) -> Result<()> {
         }
     }
 
+    // IPv6 transition prefixes that EMBED an IPv4 destination (CARAPACE-17). A NAT64 /
+    // 6to4 gateway on the path delivers these to the embedded IPv4 host, so it must pass
+    // exactly the checks a literal IPv4 destination would.
+
+    // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052): IPv4 in the low 32 bits.
+    if segs[0] == 0x0064 && segs[1] == 0xFF9B
+        && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0
+    {
+        let v4 = embedded_v4(segs[6], segs[7]);
+        return check_ipv4(&v4).map_err(|_| {
+            ssrf(format!("NAT64 address embeds a blocked IPv4: {ip} (embedded {v4})"))
+        });
+    }
+
+    // 64:ff9b:1::/48 — NAT64 local-use prefix (RFC 8215). Where the IPv4 sits depends
+    // on a network-specific prefix length, and a local-use prefix is never a public
+    // destination: blocked outright.
+    if segs[0] == 0x0064 && segs[1] == 0xFF9B && segs[2] == 0x0001 {
+        return Err(ssrf(format!("NAT64 local-use prefix (RFC 8215): {ip}")));
+    }
+
+    // 2002::/16 — 6to4 (RFC 3056): IPv4 in bits 16..48.
+    if segs[0] == 0x2002 {
+        let v4 = embedded_v4(segs[1], segs[2]);
+        return check_ipv4(&v4).map_err(|_| {
+            ssrf(format!("6to4 address embeds a blocked IPv4: {ip} (embedded {v4})"))
+        });
+    }
+
+    // 2001:0000::/32 — Teredo (RFC 4380). The client IPv4 is obfuscated and a
+    // tunnelling address is never a legitimate fetch target: blocked outright. Only
+    // this /32 — the rest of 2001::/16 is ordinary global unicast.
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        return Err(ssrf(format!("Teredo tunnelling address (RFC 4380): {ip}")));
+    }
+
     // 100::/64 — Discard-only (RFC 6666)
     if segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 {
         return Err(ssrf(format!("discard-only range (RFC 6666): {ip}")));
     }
 
     Ok(())
+}
+
+/// The IPv4 address held in two consecutive 16-bit IPv6 segments.
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new((hi >> 8) as u8, (hi & 0xFF) as u8, (lo >> 8) as u8, (lo & 0xFF) as u8)
 }
 
 /// Validate that a URL scheme is permitted.
@@ -181,6 +214,66 @@ mod tests {
         // ::ffff:192.168.1.1
         assert!(is_safe_ip(&v6("::ffff:192.168.1.1")).is_err());
         assert!(is_safe_ip(&v6("::ffff:127.0.0.1")).is_err());
+    }
+
+    // CARAPACE-17: IPv6 transition prefixes that embed an IPv4 address. A NAT64 or
+    // 6to4 gateway on the path would deliver these to the embedded IPv4 host, so the
+    // embedded address must pass the same checks as a literal IPv4 destination.
+    #[test]
+    fn blocks_nat64_embedded_private() {
+        // 64:ff9b::/96 well-known prefix (RFC 6052): IPv4 in the low 32 bits.
+        assert!(is_safe_ip(&v6("64:ff9b::7f00:1")).is_err()); // 127.0.0.1
+        assert!(is_safe_ip(&v6("64:ff9b::a00:1")).is_err()); // 10.0.0.1
+        assert!(is_safe_ip(&v6("64:ff9b::c0a8:101")).is_err()); // 192.168.1.1
+        assert!(is_safe_ip(&v6("64:ff9b::a9fe:a9fe")).is_err()); // 169.254.169.254 (metadata)
+        assert!(is_safe_ip(&v6("64:ff9b::6440:1")).is_err()); // 100.64.0.1 (CGNAT)
+    }
+
+    #[test]
+    fn allows_nat64_embedded_public() {
+        assert!(is_safe_ip(&v6("64:ff9b::808:808")).is_ok()); // 8.8.8.8
+        assert!(is_safe_ip(&v6("64:ff9b::101:101")).is_ok()); // 1.1.1.1
+    }
+
+    #[test]
+    fn blocks_nat64_local_use_prefix() {
+        // 64:ff9b:1::/48 local-use prefix (RFC 8215): the IPv4 position depends on a
+        // network-specific prefix length, and it is never a public destination —
+        // blocked outright, even when the tail looks like a public address.
+        assert!(is_safe_ip(&v6("64:ff9b:1::a00:1")).is_err());
+        assert!(is_safe_ip(&v6("64:ff9b:1::808:808")).is_err());
+        assert!(is_safe_ip(&v6("64:ff9b:1:ffff::1")).is_err());
+    }
+
+    #[test]
+    fn blocks_6to4_embedded_private() {
+        // 2002::/16 (RFC 3056): IPv4 in bits 16..48.
+        assert!(is_safe_ip(&v6("2002:7f00:1::1")).is_err()); // 127.0.0.1
+        assert!(is_safe_ip(&v6("2002:a00:1::")).is_err()); // 10.0.0.1
+        assert!(is_safe_ip(&v6("2002:c0a8:101::1")).is_err()); // 192.168.1.1
+        assert!(is_safe_ip(&v6("2002:a9fe:a9fe::1")).is_err()); // 169.254.169.254
+    }
+
+    #[test]
+    fn allows_6to4_embedded_public() {
+        assert!(is_safe_ip(&v6("2002:808:808::1")).is_ok()); // 8.8.8.8
+    }
+
+    #[test]
+    fn blocks_teredo() {
+        // 2001::/32 (RFC 4380): the client IPv4 is obfuscated and a tunnelling address
+        // is never a legitimate fetch target — blocked outright.
+        assert!(is_safe_ip(&v6("2001::1")).is_err());
+        assert!(is_safe_ip(&v6("2001:0:4136:e378:8000:63bf:3fff:fdd2")).is_err());
+    }
+
+    #[test]
+    fn teredo_block_is_exactly_2001_0000() {
+        // Only 2001:0000::/32 is Teredo. The rest of 2001::/16 is ordinary global
+        // unicast and must stay reachable (2001:db8::/32 stays blocked as documentation).
+        assert!(is_safe_ip(&v6("2001:4860:4860::8888")).is_ok()); // Google Public DNS
+        assert!(is_safe_ip(&v6("2001:1::1")).is_ok());
+        assert!(is_safe_ip(&v6("2001:db8::1")).is_err());
     }
 
     #[test]
