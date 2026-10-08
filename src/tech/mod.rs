@@ -535,7 +535,7 @@ fn extract_version_from_url(url: &str) -> Option<String> {
     // Match CDN version patterns: @4.0.0, /3.6.1/, -2.1.1.min.js
     let re = regex::Regex::new(r"[@/v](\d+\.\d+(?:\.\d+)?)(?:[/.\-]|$)").ok()?;
     re.find(url).and_then(|m| {
-        let s = m.as_str().trim_start_matches(|c| c == '@' || c == '/' || c == 'v');
+        let s = m.as_str().trim_start_matches(['@', '/', 'v']);
         let v = s.trim_end_matches(|c: char| !c.is_numeric());
         if v.is_empty() { None } else { Some(v.to_string()) }
     })

@@ -394,7 +394,7 @@ fn tunnel(client: TcpStream, upstream: TcpStream) {
         return;
     };
     let h = std::thread::spawn(move || copy_capped(client, up_w));
-    let _ = copy_capped(upstream, client_w);
+    copy_capped(upstream, client_w);
     let _ = h.join();
 }
 

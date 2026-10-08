@@ -261,7 +261,7 @@ fn browser_render(
     ));
 
     std::fs::write(&tmp_path, self_contained_html.as_bytes())
-        .map_err(|e| crate::error::CarapaceError::Io(e))?;
+        .map_err(crate::error::CarapaceError::Io)?;
 
     info!("self-contained HTML written to {} ({} bytes)", tmp_path.display(), self_contained_html.len());
 
@@ -403,7 +403,7 @@ fn browser_render(
     // shell. The result is exposed as report.rendered_html so the caller can run the
     // full HTML/JS analysers on the real content. Falls back to the offline file://
     // dump otherwise.
-    let dumped_dom = if !screenshot_result.is_ok() {
+    let dumped_dom = if screenshot_result.is_err() {
         String::new()
     } else if let Some(dom) = cdp_dom {
         // CDP already captured the live post-JS DOM in the same session — no need
@@ -447,7 +447,7 @@ fn browser_render(
     if let Ok(ref intercepted) = screenshot_result {
         let external: Vec<String> = intercepted
             .iter()
-            .filter(|u| !is_same_site(&base_url, u) && !is_browser_infrastructure(u))
+            .filter(|u| !is_same_site(base_url, u) && !is_browser_infrastructure(u))
             .cloned()
             .collect();
         if !external.is_empty() {
@@ -517,6 +517,12 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
     static RGBA_BACKDROP_RE: OnceLock<Regex> = OnceLock::new();
     let rgba_backdrop_re = RGBA_BACKDROP_RE.get_or_init(|| {
         Regex::new(r"rgba\s*\([^)]*,\s*0?\.[0-9]").unwrap()
+    });
+
+    // A small fixed-pixel background-size marks a loading screen (see below).
+    static BG_SIZE_PX_RE: OnceLock<Regex> = OnceLock::new();
+    let bg_size_px_re = BG_SIZE_PX_RE.get_or_init(|| {
+        Regex::new(r"background-size\s*:\s*\d{1,3}px").unwrap()
     });
 
     for css in css_sheets {
@@ -692,13 +698,7 @@ fn check_css_overlay_threat(css_sheets: &[String], report: &mut ThreatReport) {
                 // takeover uses background-size:cover/100%/auto to fill the viewport
                 // with a fake prompt, never a 100px sprite. (caixesp preloader case —
                 // live render split the background-image into a separate CSS rule.)
-                || {
-                    static BG_SIZE_PX_RE: OnceLock<Regex> = OnceLock::new();
-                    let re = BG_SIZE_PX_RE.get_or_init(|| {
-                        Regex::new(r"background-size\s*:\s*\d{1,3}px").unwrap()
-                    });
-                    re.is_match(&lower)
-                };
+                || bg_size_px_re.is_match(&lower);
             if is_loading_screen {
                 continue;
             }
@@ -795,7 +795,7 @@ fn check_dynamic_overlay_injected(
         let full_tag = &cap[0]; // the complete <tag ... > string
 
         // Skip inline elements.
-        if INLINE_TAGS.iter().any(|&t| t == tag.as_str()) {
+        if INLINE_TAGS.contains(&tag.as_str()) {
             continue;
         }
 

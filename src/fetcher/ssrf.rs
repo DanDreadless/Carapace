@@ -94,11 +94,14 @@ fn check_ipv6(ip: &Ipv6Addr) -> Result<()> {
         return Err(ssrf(format!("documentation range (RFC 3849): {ip}")));
     }
 
-    // 64:ff9b::/96 and ::ffff:0:0/96 — IPv4-mapped / NAT64
-    // Re-validate the embedded IPv4 address.
+    // ::ffff:0:0/96 (IPv4-mapped) and ::/96 (IPv4-compatible, deprecated) —
+    // re-validate the embedded IPv4 address.
+    // NOTE: 64:ff9b::/96 (NAT64) is NOT covered here despite earlier comments; it
+    // needs its own prefix check (tracked separately — a behaviour change, kept out
+    // of the lint-only commit).
     if segs[0] == 0 && segs[1] == 0 && segs[2] == 0
         && segs[3] == 0 && segs[4] == 0
-        && (segs[5] == 0xFFFF || (segs[4] == 0 && segs[5] == 0))
+        && (segs[5] == 0xFFFF || segs[5] == 0)
     {
         let v4 = Ipv4Addr::new(
             (segs[6] >> 8) as u8,

@@ -450,60 +450,6 @@ fn detect_bitb(document: &Handle, base_url: &Url, report: &mut ThreatReport) {
     report.add_bitb_fake_window(&detail);
 }
 
-#[cfg(test)]
-mod bitb_tests {
-    use super::*;
-    use crate::threat::ThreatReport;
-
-    fn run(html: &str, page_url: &str) -> ThreatReport {
-        let mut report = ThreatReport::new(page_url);
-        let processor = HtmlProcessor::new(Url::parse(page_url).unwrap());
-        let _ = processor.process(html.as_bytes(), &mut report);
-        report
-    }
-
-    const BITB_HTML: &str = r#"<html><head><style>
-        .titlebar{border-radius:8px 8px 0 0}
-        .dot{width:12px;height:12px;border-radius:50%;background:#ff5f56}</style></head>
-        <body><div class="fake-browser"><div class="titlebar">
-        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <span class="url-bar">https://login.microsoftonline.com/common/oauth2/authorize</span></div>
-        <form><input type="password" name="passwd"></form></div></body></html>"#;
-
-    #[test]
-    fn fires_on_bitb_non_official_domain() {
-        let r = run(BITB_HTML, "https://evil-login.com/");
-        assert!(r.has_flag_code("BITB_FAKE_WINDOW"));
-    }
-
-    #[test]
-    fn clean_on_official_brand_domain() {
-        let r = run(BITB_HTML, "https://login.microsoftonline.com/");
-        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
-    }
-
-    #[test]
-    fn clean_on_gsi_button_script_src() {
-        // Google Sign-In: brand URL only in a <script src>, not visible text; no chrome.
-        let html = r#"<html><body>
-            <script src="https://accounts.google.com/gsi/client"></script>
-            <form><input type="password"></form></body></html>"#;
-        let r = run(html, "https://myshop.com/");
-        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
-    }
-
-    #[test]
-    fn clean_when_brand_url_only_in_inline_script() {
-        // An inline script mentioning the brand login URL must NOT trip the gate.
-        let html = r#"<html><head><style>.titlebar{}</style></head><body>
-            <script>var x="redirect to https://login.microsoftonline.com later";</script>
-            <div class="titlebar url-bar"></div>
-            <form><input type="password"></form></body></html>"#;
-        let r = run(html, "https://evil.com/");
-        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
-    }
-}
-
 // ── RcDom → DomSnapshot ───────────────────────────────────────────────────────
 
 /// Convert a sanitised `RcDom` into the same `DomSnapshot` format that the JS
@@ -593,5 +539,59 @@ fn node_to_snapshot(handle: &Handle) -> crate::js::vdom::DomSnapshot {
                 children: Vec::new(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bitb_tests {
+    use super::*;
+    use crate::threat::ThreatReport;
+
+    fn run(html: &str, page_url: &str) -> ThreatReport {
+        let mut report = ThreatReport::new(page_url);
+        let processor = HtmlProcessor::new(Url::parse(page_url).unwrap());
+        let _ = processor.process(html.as_bytes(), &mut report);
+        report
+    }
+
+    const BITB_HTML: &str = r#"<html><head><style>
+        .titlebar{border-radius:8px 8px 0 0}
+        .dot{width:12px;height:12px;border-radius:50%;background:#ff5f56}</style></head>
+        <body><div class="fake-browser"><div class="titlebar">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span class="url-bar">https://login.microsoftonline.com/common/oauth2/authorize</span></div>
+        <form><input type="password" name="passwd"></form></div></body></html>"#;
+
+    #[test]
+    fn fires_on_bitb_non_official_domain() {
+        let r = run(BITB_HTML, "https://evil-login.com/");
+        assert!(r.has_flag_code("BITB_FAKE_WINDOW"));
+    }
+
+    #[test]
+    fn clean_on_official_brand_domain() {
+        let r = run(BITB_HTML, "https://login.microsoftonline.com/");
+        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
+    }
+
+    #[test]
+    fn clean_on_gsi_button_script_src() {
+        // Google Sign-In: brand URL only in a <script src>, not visible text; no chrome.
+        let html = r#"<html><body>
+            <script src="https://accounts.google.com/gsi/client"></script>
+            <form><input type="password"></form></body></html>"#;
+        let r = run(html, "https://myshop.com/");
+        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
+    }
+
+    #[test]
+    fn clean_when_brand_url_only_in_inline_script() {
+        // An inline script mentioning the brand login URL must NOT trip the gate.
+        let html = r#"<html><head><style>.titlebar{}</style></head><body>
+            <script>var x="redirect to https://login.microsoftonline.com later";</script>
+            <div class="titlebar url-bar"></div>
+            <form><input type="password"></form></body></html>"#;
+        let r = run(html, "https://evil.com/");
+        assert!(!r.has_flag_code("BITB_FAKE_WINDOW"));
     }
 }

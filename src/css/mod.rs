@@ -8,8 +8,16 @@ pub type StyleMap = HashMap<String, HashMap<String, String>>;
 
 /// CSS custom property name (without `--`) → raw value.
 pub type CssVarMap = HashMap<String, String>;
+/// Rules parsed from one stylesheet: (selector, declarations).
+type RuleList = Vec<(String, HashMap<String, String>)>;
 
 pub struct CssProcessor;
+
+impl Default for CssProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CssProcessor {
     pub fn new() -> Self { Self }
@@ -54,7 +62,7 @@ impl CssProcessor {
         })
     }
 
-    fn process_one(&self, css: &str) -> Result<(Vec<(String, HashMap<String, String>)>, CssVarMap)> {
+    fn process_one(&self, css: &str) -> Result<(RuleList, CssVarMap)> {
         let css = self.strip_dangerous(css);
         let css = strip_comments(&css);
 
@@ -118,8 +126,8 @@ impl CssProcessor {
             let lower_sel = selector_text.to_ascii_lowercase();
             if lower_sel == ":root" || lower_sel == "html" || lower_sel == ":root,html" {
                 for (k, v) in &props {
-                    if k.starts_with("--") {
-                        vars.insert(k[2..].to_string(), v.clone());
+                    if let Some(name) = k.strip_prefix("--") {
+                        vars.insert(name.to_string(), v.clone());
                     }
                 }
                 // Also add html as a real rule (for body defaults)

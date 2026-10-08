@@ -493,7 +493,7 @@ pub fn annotate_screenshot(path: &Path, risk_score: u8, domain: &str, scan_time:
     // ── Domain ────────────────────────────────────────────────────────────────
     let domain_x = pill_x as f32 + pill_w as f32 + 12.0;
     // Right-side reserve is proportional to width so text doesn't cramp on 375px mobile captures.
-    let right_reserve = (w as f32 * 0.38).min(220.0).max(80.0);
+    let right_reserve = (w as f32 * 0.38).clamp(80.0, 220.0);
     if let Some(f) = regular {
         let max_domain_w = (w as f32 - domain_x - right_reserve).max(40.0);
         let truncated = truncate_text(f, font_sz, domain, max_domain_w);

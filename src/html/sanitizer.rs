@@ -94,10 +94,7 @@ impl<'a> Sanitizer<'a> {
                     // Allowed element: sanitise attributes.
                     self.sanitize_attrs(&tag, attrs);
 
-                    match tag.as_str() {
-                        "meta" => self.handle_meta(&child, attrs),
-                        _ => {}
-                    }
+                    if tag.as_str() == "meta" { self.handle_meta(&child, attrs) }
 
                     self.walk(&child);
                     idx += 1;

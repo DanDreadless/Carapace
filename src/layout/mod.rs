@@ -226,16 +226,16 @@ impl LayoutEngine {
         };
 
         // Text nodes: give them height based on font size
-        if snapshot.tag == "#text" {
-            if snapshot.text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
-                let line_count = estimate_line_count(
-                    snapshot.text.as_deref().unwrap_or(""),
-                    self.viewport_width,
-                    font_size,
-                );
-                style.size.height = Dimension::Length(font_size * 1.4 * line_count as f32);
-                style.size.width = Dimension::Percent(1.0);
-            }
+        if snapshot.tag == "#text"
+            && snapshot.text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+        {
+            let line_count = estimate_line_count(
+                snapshot.text.as_deref().unwrap_or(""),
+                self.viewport_width,
+                font_size,
+            );
+            style.size.height = Dimension::Length(font_size * 1.4 * line_count as f32);
+            style.size.width = Dimension::Percent(1.0);
         }
 
         // Headings / paragraphs: min-height so empty ones still take space
@@ -248,6 +248,9 @@ impl LayoutEngine {
         style
     }
 
+    // Recursive walker threading parent offsets, inherited props and the output tree;
+    // bundling these into a struct would only move the arguments around.
+    #[allow(clippy::too_many_arguments)]
     fn extract_layout(
         &self, taffy: &TaffyTree, node: NodeId, snapshot: &DomSnapshot,
         style_map: &StyleMap, parent_x: f32, parent_y: f32, path: &str,

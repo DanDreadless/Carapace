@@ -97,18 +97,20 @@ fn main_frame_id_from_target(target_id: &str) -> String {
     target_id.to_string()
 }
 
+/// What one live CDP render captures: (post-JS DOM, runtime scripts as (url, body),
+/// navigation targets).
+type LiveCapture = (String, Vec<(String, String)>, Vec<String>);
+
 fn chromium_bin() -> Option<&'static str> {
-    for n in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-        if Command::new("which")
-            .arg(n)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return Some(n);
-        }
-    }
-    None
+    ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]
+        .into_iter()
+        .find(|n| {
+            Command::new("which")
+                .arg(n)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
 }
 
 /// Create an anonymous pipe with both ends O_CLOEXEC. Returns (read, write).
@@ -735,7 +737,7 @@ pub fn cdp_render(
     };
     let (done, watchdog) = spawn_watchdog(sess.pgid, deadline);
 
-    let result = (|| -> Result<(String, Vec<(String, String)>, Vec<String>)> {
+    let result = (|| -> Result<LiveCapture> {
         let created = sess.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
         let target_id = created
             .get("targetId")

@@ -460,7 +460,7 @@ fn setup_document<'js>(
         let cw = Arc::clone(&clipboard_writes);
         let exec_command = Function::new(ctx.clone(), move |cmd: Option<String>, _show: Value, _val: Value| -> bool {
             let cmd = cmd.unwrap_or_default();
-            if cmd.to_ascii_lowercase() == "copy" {
+            if cmd.eq_ignore_ascii_case("copy") {
                 warn!("sandbox: document.execCommand('copy') intercepted");
                 cw.lock().unwrap().push(("document.execCommand".to_string(), String::new()));
             }
